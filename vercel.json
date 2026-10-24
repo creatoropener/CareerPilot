@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/search-jobs.ts": {
+      "maxDuration": 60
+    },
+    "api/analyze-job.ts": {
+      "maxDuration": 60
+    },
+    "api/extract-profile.ts": {
+      "maxDuration": 60
+    }
+  }
+}
