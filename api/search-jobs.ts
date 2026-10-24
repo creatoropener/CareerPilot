@@ -1,7 +1,14 @@
 // Vercel Function: POST /api/search-jobs
+// Searches ONLY the portals the user ticked and returns ONLY listings whose posting date can be verified
+// to fall inside the chosen time window.
 // Proxies a small set of search terms to Tavily so the API key never reaches the browser.
 
+import { findPostedDate, hostMatches, isSourceId, isTimeWindowId, isWithinWindow, SOURCE_DOMAINS, toDateOnly, WINDOW_DAYS } from '../lib/recency.js';
+import type { SourceId, TimeWindowId } from '../lib/recency.js';
+
 interface SearchRequest {
+  timeWindow?: string;
+  sources?: string[];
   targetRoles?: string;
   skills?: string;
   location?: string;
@@ -14,6 +21,7 @@ interface TavilyResult {
   content?: string;
   score?: number;
   published_date?: string;
+  raw_content?: string | null;
 }
 
 interface TavilyResponse {
@@ -111,7 +119,14 @@ async function planQueries(profile: SearchRequest): Promise<string[]> {
   }
 }
 
-async function runSearch(query: string, apiKey: string): Promise<TavilyResult[]> {
+interface SearchOptions {
+  window: TimeWindowId;
+  now: Date;
+  domains: string[];
+}
+
+async function runSearch(query: string, apiKey: string, options: SearchOptions): Promise<TavilyResult[]> {
+  const start = new Date(options.now.getTime() - WINDOW_DAYS[options.window] * 86_400_000);
   const response = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { ...JSON_HEADERS, Authorization: `Bearer ${apiKey}` },
@@ -120,9 +135,14 @@ async function runSearch(query: string, apiKey: string): Promise<TavilyResult[]>
       query,
       topic: 'general',
       search_depth: 'basic',
-      max_results: 7,
+      max_results: 10,
       include_answer: false,
-      include_raw_content: false,
+      // raw content is only read on the server to find a posting date; it is never sent to the browser.
+      include_raw_content: 'text',
+      include_published_date: true,
+      start_date: toDateOnly(start),
+      end_date: toDateOnly(options.now),
+      include_domains: options.domains,
     }),
   });
   if (!response.ok) {
@@ -135,6 +155,25 @@ async function runSearch(query: string, apiKey: string): Promise<TavilyResult[]>
 
 function canonicalKey(url: string): string {
   return url.split('#')[0].replace(/\/$/, '').toLowerCase();
+}
+
+interface SearchJob {
+  query: string;
+  domains: string[];
+}
+
+// One call per (portal, query). Portals use the two general queries; ATS pages use the third.
+// The total is bounded to 5 calls so one click cannot burn many API credits.
+function buildJobs(sources: SourceId[], queries: string[]): SearchJob[] {
+  const portals = sources.filter((source) => source !== 'ats');
+  const jobs: SearchJob[] = [];
+  const perPortal = portals.length <= 2 ? 2 : 1;
+  for (const portal of portals) {
+    for (const query of queries.slice(0, perPortal)) jobs.push({ query, domains: [SOURCE_DOMAINS[portal][0]] });
+    if (SOURCE_DOMAINS[portal].length > 1 && perPortal === 1) jobs.push({ query: queries[0], domains: [SOURCE_DOMAINS[portal][1]] });
+  }
+  if (sources.includes('ats')) jobs.push({ query: queries[2] ?? queries[0], domains: SOURCE_DOMAINS.ats });
+  return jobs.slice(0, 5);
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -151,6 +190,19 @@ export async function POST(request: Request): Promise<Response> {
   }
   if (!profile || typeof profile !== 'object') {
     return json({ error: 'Request body must be a JSON object.' }, 400);
+  }
+
+  // The time window is mandatory and there is deliberately no "all time" value.
+  if (!isTimeWindowId(profile.timeWindow)) {
+    return json({ error: 'Choose a time window: last 1 day, 1 week, 2 weeks, 3 weeks or 4 weeks.' }, 400);
+  }
+  const window: TimeWindowId = profile.timeWindow;
+
+  const sources = Array.isArray(profile.sources)
+    ? [...new Set(profile.sources.filter((source): source is SourceId => isSourceId(source)))]
+    : [];
+  if (sources.length === 0) {
+    return json({ error: 'Select at least one job source to search.' }, 400);
   }
 
   const targetRoles = cleanField(profile.targetRoles);
@@ -170,9 +222,10 @@ export async function POST(request: Request): Promise<Response> {
   const queries = [...planned, ...ruleQueries.slice(planned.length)].slice(0, 3);
   const planner = planned.length > 0 ? 'nemotron' : 'rules';
 
-  // Three bounded basic searches per click; the resume text itself is never sent here.
+  const now = new Date();
+  const jobs = buildJobs(sources, queries);
   // allSettled so one slow or failing query does not throw away the others.
-  const settled = await Promise.allSettled(queries.map((query) => runSearch(query, apiKey)));
+  const settled = await Promise.allSettled(jobs.map((job) => runSearch(job.query, apiKey, { window, now, domains: job.domains })));
   const fulfilled = settled.filter((entry): entry is PromiseFulfilledResult<TavilyResult[]> => entry.status === 'fulfilled');
   if (fulfilled.length === 0) {
     const first = settled.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
@@ -180,28 +233,41 @@ export async function POST(request: Request): Promise<Response> {
     return json({ error: `Job search failed. ${message}` }, 502);
   }
 
+  const allowedDomains = sources.flatMap((source) => SOURCE_DOMAINS[source]);
+  const excluded = { otherSource: 0, undated: 0, tooOld: 0, invalid: 0 };
   const seen = new Set<string>();
-  const results = fulfilled.flatMap((entry) => entry.value).filter((result) => {
-    if (!result.url) return false;
+  const results = [];
+  for (const result of fulfilled.flatMap((entry) => entry.value)) {
+    if (!result.url) { excluded.invalid += 1; continue; }
     try {
-      const parsed = new URL(result.url);
-      if (!['http:', 'https:'].includes(parsed.protocol)) return false;
-    } catch {
-      return false;
-    }
+      if (!['http:', 'https:'].includes(new URL(result.url).protocol)) { excluded.invalid += 1; continue; }
+    } catch { excluded.invalid += 1; continue; }
     const key = canonicalKey(result.url);
-    if (seen.has(key)) return false;
+    if (seen.has(key)) continue;
     seen.add(key);
-    return true;
-  }).map((result) => ({
-    title: cleanField(result.title) || 'Untitled job search result',
-    url: result.url as string,
-    content: cleanField(result.content),
-    score: typeof result.score === 'number' ? result.score : undefined,
-    publishedDate: result.published_date || null,
-  }));
 
-  return json({ results, queriesRun: fulfilled.length, queries, planner }, 200, { 'Cache-Control': 'no-store' });
+    // User-selected portals only.
+    if (!hostMatches(result.url, allowedDomains)) { excluded.otherSource += 1; continue; }
+
+    // Strict time window: no verifiable date, or a date outside the window, means the listing is dropped.
+    const posted = findPostedDate({
+      publishedDate: result.published_date,
+      text: `${result.title ?? ''}\n${result.content ?? ''}\n${(result.raw_content ?? '').slice(0, 20_000)}`,
+    }, now);
+    if (!posted) { excluded.undated += 1; continue; }
+    if (!isWithinWindow(posted.date, window, now)) { excluded.tooOld += 1; continue; }
+
+    results.push({
+      title: cleanField(result.title) || 'Untitled job search result',
+      url: result.url,
+      content: cleanField(result.content),
+      score: typeof result.score === 'number' ? result.score : undefined,
+      publishedDate: posted.date.toISOString(),
+      dateSource: posted.source,
+    });
+  }
+
+  return json({ results, queriesRun: fulfilled.length, queries, planner, timeWindow: window, sources, excluded }, 200, { 'Cache-Control': 'no-store' });
 }
 
 export function GET(): Response {

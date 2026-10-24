@@ -18,8 +18,12 @@ A browser-first TypeScript app for discovering potentially relevant jobs, explai
 ## Current scope
 
 - Career profile: target titles, skills, location, work mode, pasted resume/experience text, and education. A local heuristic extractor suggests common skills and likely role/education lines for the user to review.
+- **CV upload:** upload a PDF, DOCX or TXT CV (max 5 MB). The text is extracted in the browser with pdf.js and mammoth; the file itself is never uploaded. Scanned/image-only CVs are not supported (paste the text instead).
+- **Mandatory time window:** every search requires one of Last 1 day (24h), 1 week, 2 weeks, 3 weeks or 4 weeks. There is no "all time" option; the server rejects requests without a valid window.
+- **Strict recency:** a listing is shown only if its posting date can be verified (search-provider date, schema.org `datePosted`, or text such as "Posted 3 days ago") and falls inside the window. Listings with no verifiable date are hidden and counted ("Hidden: N without a verifiable posting date"). This favours correctness over volume, so some searches return few results.
+- **User-selected sources only:** tick any of LinkedIn, Indeed, Glassdoor, Naukri and company career sites (Greenhouse, Lever, Workday, Ashby). Only ticked sources are searched and results from any other site are dropped. At least one source is required.
 - Search across public web results using Tavily through a Vercel Function.
-- Three bounded search queries per click; duplicates are removed and original URLs are preserved.
+- At most five bounded Tavily calls per click (one or two queries per ticked source); duplicates are removed and original URLs are preserved.
 - Local keyword-based ranking with visible matching terms and skills not found in the snippets.
 - **Optional AI explanation (NVIDIA Nemotron on Nebius Token Factory).** Each result has an "Explain with Nemotron" button. A server-side function (`api/analyze-job.ts`) sends the listing snippet plus your target roles, skills, location and education to a Nemotron model and shows strengths, possible gaps and things to verify. Your pasted resume text is sent only if you tick the opt-in box in the profile panel. The AI text is advisory and never changes the keyword match percentage.
 - Save jobs, track `Saved / Applied / Interview / Offer / Rejected`, add a job URL manually, and export/import a JSON backup.
@@ -75,6 +79,7 @@ npm run build
 ## Important limitations before a public launch
 
 - Matching is a transparent **keyword-overlap estimate** based on a search result's title, URL and short snippet. It is not an AI assessment, a probability of being hired, or a guarantee that the role is open. Users should visit the original listing and verify details.
+- Portals are searched through public search-engine results (Tavily), not by logging in to or scraping them, and coverage of each portal is partial. Always open the original listing to confirm it is still open.
 - Search results can include category pages, expired listings, or related pages, not only active vacancies. The app labels results as potential listings rather than claiming every result is verified.
 - The current MVP sends only target role titles, selected skills, location, and work preference to Tavily. Query planning sends the same roles, skills, location and work mode to the Nebius-hosted model. "Extract profile with Nemotron AI" sends the pasted resume text, only when you click it. When you click "Explain with Nemotron", the listing snippet, your roles, skills, location and education go to the Nebius-hosted model, and your resume text too only if you opt in. This means those search terms leave the device. Do not send full resume text or personal contact information to the search provider.
 - Add server-side rate limiting, caching, usage monitoring, provider attribution/terms review, abuse protection, and a privacy notice before opening the API endpoint to the public. This starter limits a click to three basic searches but is not a complete abuse-prevention system.
@@ -88,8 +93,12 @@ src/
   App.tsx                 UI and local job tracking
   lib/types.ts            Shared type definitions
   lib/matcher.ts          URL normalization, simple matching, fallback links
+  lib/cv.ts               Browser-side CV text extraction (PDF, DOCX, TXT)
+  lib/window.ts           Time-window and source options for the UI
   test/matcher.test.ts    Matcher tests
   styles.css              Responsive UI styles
+lib/
+  recency.ts              Server-side posting-date detection, time windows, portal domains
 api/
   search-jobs.ts          Vercel Function: server-side Tavily search proxy
   analyze-job.ts          Vercel Function: Nemotron (Nebius) match explanation
@@ -98,5 +107,6 @@ tests/
   analyze-job.test.ts     Tests for the AI functions and query planner (mocked providers)
   extract-profile.test.ts
   search-jobs.test.ts
+  recency.test.ts
 vercel.json               Build and function configuration
 ```

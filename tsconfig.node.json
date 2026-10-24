@@ -18,6 +18,7 @@
   "include": [
     "vite.config.ts",
     "api/**/*.ts",
+    "lib/**/*.ts",
     "tests/**/*.ts"
   ]
 }

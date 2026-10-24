@@ -1,3 +1,6 @@
+import type { SourceId, TimeWindowId } from './window';
+import { DEFAULT_SOURCES, DEFAULT_TIME_WINDOW } from './window';
+
 export type WorkMode = 'Any' | 'Remote' | 'Hybrid' | 'On-site';
 export type ApplicationStatus = 'Saved' | 'Applied' | 'Interview' | 'Offer' | 'Rejected';
 
@@ -8,6 +11,8 @@ export interface CareerProfile {
   workMode: WorkMode;
   experienceSummary: string;
   education: string;
+  timeWindow: TimeWindowId;
+  sources: SourceId[];
 }
 
 export interface RawJobResult {
@@ -42,6 +47,7 @@ export interface JobSearchResponse {
   queriesRun: number;
   queries?: string[];
   planner?: 'nemotron' | 'rules';
+  excluded?: { otherSource: number; undated: number; tooOld: number; invalid: number };
 }
 
 export const DEFAULT_PROFILE: CareerProfile = {
@@ -51,6 +57,8 @@ export const DEFAULT_PROFILE: CareerProfile = {
   workMode: 'Any',
   experienceSummary: '',
   education: '',
+  timeWindow: DEFAULT_TIME_WINDOW,
+  sources: [...DEFAULT_SOURCES],
 };
 
 export const STATUS_OPTIONS: ApplicationStatus[] = ['Saved', 'Applied', 'Interview', 'Offer', 'Rejected'];

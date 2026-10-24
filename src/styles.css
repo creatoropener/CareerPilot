@@ -321,3 +321,10 @@ h1 span { color: #4066de; }
 .query-list { margin: 0 0 12px; padding: 9px 13px; border: 1px solid #e6ebf3; border-radius: 12px; background: #fbfcfe; font-size: 10px; color: #5d6a82; }
 .query-list summary { cursor: pointer; font-weight: 700; color: #3f64da; }
 .query-list ul { margin: 7px 0 0; padding-left: 17px; word-break: break-word; }
+
+.cv-upload { margin-bottom: 4px; }
+.search-settings { border: 1px solid #e6ebf3; border-radius: 12px; padding: 12px; margin: 6px 0 12px; background: #fbfcfe; }
+.source-set { border: 0; padding: 0; margin: 12px 0 0; }
+.source-set legend { padding: 0; margin-bottom: 6px; }
+.source-option { display: flex; align-items: flex-start; gap: 8px; font-size: 11px; color: #35435c; padding: 4px 0; line-height: 1.35; }
+.source-option input { margin-top: 2px; flex-shrink: 0; }

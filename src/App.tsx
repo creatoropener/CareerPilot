@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownRight, ArrowRight, Bookmark, BriefcaseBusiness, Check, CheckCircle2,
-  ChevronDown, CircleHelp, ExternalLink, FileDown, Filter, Globe2,
+  ChevronDown, CircleHelp, ExternalLink, FileDown, FileUp, Filter, Globe2,
   RefreshCw, Search, ShieldCheck,
   SlidersHorizontal, Sparkles, Target, Trash2, TrendingUp, X, Zap,
 } from 'lucide-react';
 import { buildSearchFallbackLinks, canonicalizeUrl, domainOf, makeJobId, rankJobs, suggestProfileFromResume } from './lib/matcher';
 import { DEFAULT_PROFILE, STATUS_OPTIONS } from './lib/types';
 import type { AiAnalysis, ApplicationStatus, CareerProfile, JobResult, JobSearchResponse, RawJobResult, WorkMode } from './lib/types';
+import { CvError, extractCvText } from './lib/cv';
+import { DEFAULT_SOURCES, DEFAULT_TIME_WINDOW, isPostedWithin, isSourceId, isTimeWindowId, SOURCE_OPTIONS, TIME_WINDOWS, windowLabel } from './lib/window';
+import type { SourceId, TimeWindowId } from './lib/window';
 import './styles.css';
 
 const PROFILE_KEY = 'careerpilot.job-radar.profile.v1';
@@ -23,6 +26,16 @@ function readLocal<T>(key: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+// Stored or imported profiles may predate the time-window and source settings, or be malformed.
+function sanitizeProfile(value: CareerProfile): CareerProfile {
+  const sources = Array.isArray(value.sources) ? [...new Set(value.sources.filter(isSourceId))] : [];
+  return {
+    ...value,
+    timeWindow: isTimeWindowId(value.timeWindow) ? value.timeWindow : DEFAULT_TIME_WINDOW,
+    sources: sources.length ? sources : [...DEFAULT_SOURCES],
+  };
 }
 
 function isSafeHttpUrl(value: unknown): value is string {
@@ -86,7 +99,7 @@ function niceDate(value?: string | null): string | null {
 }
 
 function App() {
-  const [profile, setProfile] = useState<CareerProfile>(() => readLocal(PROFILE_KEY, DEFAULT_PROFILE));
+  const [profile, setProfile] = useState<CareerProfile>(() => sanitizeProfile(readLocal(PROFILE_KEY, DEFAULT_PROFILE)));
   const [savedJobs, setSavedJobs] = useState<JobResult[]>(readJobs);
   const [results, setResults] = useState<JobResult[]>([]);
   const [tab, setTab] = useState<Tab>('radar');
@@ -106,6 +119,9 @@ function App() {
   const [extracting, setExtracting] = useState(false);
   const [lastQueries, setLastQueries] = useState<{ queries: string[]; planner: 'nemotron' | 'rules' } | null>(null);
   const importInput = useRef<HTMLInputElement>(null);
+  const cvInput = useRef<HTMLInputElement>(null);
+  const [cvName, setCvName] = useState('');
+  const [cvLoading, setCvLoading] = useState(false);
 
   useEffect(() => {
     try { localStorage.setItem(PROFILE_KEY, JSON.stringify(profile)); } catch { /* storage can be disabled */ }
@@ -128,12 +144,12 @@ function App() {
     setProfile((current) => ({ ...current, [key]: value }));
   }
 
-  function extractResumeDetails() {
-    if (!profile.experienceSummary.trim()) {
+  function extractResumeDetails(text: string = profile.experienceSummary) {
+    if (!text.trim()) {
       setSearchError('Paste resume text or an experience summary before extracting details.');
       return;
     }
-    const suggestions = suggestProfileFromResume(profile.experienceSummary);
+    const suggestions = suggestProfileFromResume(text);
     setProfile((current) => ({
       ...current,
       targetRoles: current.targetRoles.trim() || suggestions.roles.join(', '),
@@ -142,6 +158,32 @@ function App() {
     }));
     setSearchError('');
     setSearchNote(`Local extraction found ${suggestions.skills.length} possible skills, ${suggestions.roles.length} possible role titles and ${suggestions.education.length} education/certification lines. Review the profile before searching.`);
+  }
+
+  async function uploadCv(file?: File) {
+    if (!file) return;
+    setCvLoading(true);
+    setSearchError('');
+    setSearchNote(`Reading ${file.name} in your browser…`);
+    try {
+      const text = await extractCvText(file);
+      setCvName(file.name);
+      setProfile((current) => ({ ...current, experienceSummary: text }));
+      extractResumeDetails(text);
+      setSearchNote(`Loaded ${text.length.toLocaleString()} characters from ${file.name}. The file stayed on your device. Review the suggested profile, or use “Extract profile with Nemotron AI” for a deeper read.`);
+    } catch (error) {
+      setSearchError(error instanceof CvError ? error.message : 'Could not read that file. Paste the text instead.');
+    } finally {
+      setCvLoading(false);
+      if (cvInput.current) cvInput.current.value = '';
+    }
+  }
+
+  function toggleSource(id: SourceId) {
+    setProfile((current) => {
+      const has = current.sources.includes(id);
+      return { ...current, sources: has ? current.sources.filter((source) => source !== id) : [...current.sources, id] };
+    });
   }
 
   async function extractWithNemotron() {
@@ -185,6 +227,12 @@ function App() {
       setShowProfileForm(true);
       return;
     }
+    if (profile.sources.length === 0) {
+      setSearchError('Select at least one job source to search.');
+      setShowProfileForm(true);
+      return;
+    }
+    const windowId: TimeWindowId = profile.timeWindow;
     setLoading(true);
     setSearchError('');
     setSearchNote('Searching public web results and ranking the available snippets…');
@@ -199,18 +247,25 @@ function App() {
           skills: profile.skills,
           location: profile.location,
           workMode: profile.workMode,
+          timeWindow: windowId,
+          sources: profile.sources,
           // Deliberately omit experienceSummary and the full resume from the request.
         }),
       });
       const payload = await response.json().catch(() => null) as (JobSearchResponse & { error?: string }) | null;
       if (!response.ok || !payload) throw new Error(payload?.error || 'Search service is not available. Use the direct-search links or add a job URL manually.');
-      const ranked = rankJobs(Array.isArray(payload.results) ? payload.results : [], profile);
+      // Defence in depth: the server already filters, but nothing outside the window is ever displayed.
+      const inWindow = (Array.isArray(payload.results) ? payload.results : []).filter((job) => isPostedWithin(job.publishedDate, windowId));
+      const ranked = rankJobs(inWindow, profile);
       setResults(ranked);
       setLastQueries(Array.isArray(payload.queries) && payload.queries.length ? { queries: payload.queries, planner: payload.planner === 'nemotron' ? 'nemotron' : 'rules' } : null);
+      const hidden = payload.excluded;
+      const hiddenNote = hidden && (hidden.undated || hidden.tooOld)
+        ? ` Hidden: ${hidden.undated} without a verifiable posting date, ${hidden.tooOld} older than ${windowLabel(windowId).replace('last ', '')}.`
+        : '';
       setSearchNote(ranked.length
-        ? `Searched ${payload.queriesRun ?? 1} targeted ${(payload.queriesRun ?? 1) === 1 ? 'query' : 'queries'}${payload.planner === 'nemotron' ? ' planned by NVIDIA Nemotron' : ''}. Results are ranked using visible listing text and your selected skills.`
-        : 'Search returned no suitable URLs. Try broader titles or remove a location restriction.');
-      if (!ranked.length) setSearchError('No listings were returned for these terms.');
+        ? `Showing listings posted within the ${windowLabel(windowId).replace('last ', 'last ')}. Searched ${payload.queriesRun ?? 1} targeted ${(payload.queriesRun ?? 1) === 1 ? 'query' : 'queries'}${payload.planner === 'nemotron' ? ' planned by NVIDIA Nemotron' : ''}. Results are ranked using visible listing text and your selected skills.${hiddenNote}`
+        : `No listings with a verifiable posting date in the ${windowLabel(windowId)} were found on the selected sources.${hiddenNote} Try a longer window, more sources or broader titles.`);
       setTab('radar');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to search right now.';
@@ -285,7 +340,7 @@ function App() {
       }
       const backup = parsed as { profile: CareerProfile; savedJobs: JobResult[] };
       if (!Array.isArray(backup.savedJobs)) throw new Error('Saved jobs in this backup are invalid.');
-      setProfile({ ...DEFAULT_PROFILE, ...(backup.profile && typeof backup.profile === 'object' ? backup.profile : {}) });
+      setProfile(sanitizeProfile({ ...DEFAULT_PROFILE, ...(backup.profile && typeof backup.profile === 'object' ? backup.profile : {}) }));
       setSavedJobs(normalizeJobs(backup.savedJobs));
       setSearchNote('Backup imported on this device.');
       setSearchError('');
@@ -377,15 +432,32 @@ function App() {
                 {field('Skills & tools', 'Use the skills you can demonstrate.', profile.skills, (value) => updateProfile('skills', value), 'e.g. SAP S/4HANA, Excel, freight auditing', 3)}
                 {field('Preferred location', 'City, region or country.', profile.location, (value) => updateProfile('location', value), 'e.g. Mumbai, India')}
                 <label className="field"><span className="field-label">Work preference</span><select value={profile.workMode} onChange={(event) => updateProfile('workMode', event.target.value as WorkMode)}><option>Any</option><option>Remote</option><option>Hybrid</option><option>On-site</option></select></label>
+                <div className="cv-upload">
+                  <button type="button" className="secondary-button full-width" onClick={() => cvInput.current?.click()} disabled={cvLoading}><FileUp size={15} /> {cvLoading ? 'Reading CV…' : cvName ? `Replace CV (${cvName})` : 'Upload CV (PDF, DOCX or TXT)'}</button>
+                  <input ref={cvInput} type="file" accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" className="hidden-input" onChange={(event) => void uploadCv(event.target.files?.[0])} />
+                  <small className="ai-extract-note">The file is read in your browser and never uploaded. Only its text is used.</small>
+                </div>
                 {field('Resume text / experience summary', 'Paste text from your resume. Extraction runs in your browser.', profile.experienceSummary, (value) => updateProfile('experienceSummary', value), 'Paste your resume text here. You can remove your phone, email and address first…', 5)}
                 <label className="ai-optin"><input type="checkbox" checked={aiIncludeResume} onChange={(event) => setAiIncludeResume(event.target.checked)} /><span>Share this resume text with the AI model when I click “Explain with Nemotron”. Off by default.</span></label>
                 <button className="primary-button full-width ai-extract-button" onClick={() => void extractWithNemotron()} disabled={extracting}><Sparkles size={15} /> {extracting ? 'Reading your resume…' : 'Extract profile with Nemotron AI'}</button>
                 <small className="ai-extract-note">Sends the resume text above to NVIDIA Nemotron on Nebius. Nothing is sent until you click.</small>
-                <button className="secondary-button full-width extract-button" onClick={extractResumeDetails}><Sparkles size={15} /> Extract locally (private, rule-based)</button>
+                <button className="secondary-button full-width extract-button" onClick={() => extractResumeDetails()}><Sparkles size={15} /> Extract locally (private, rule-based)</button>
                 {field('Education & qualifications', 'Add or correct degrees and certifications.', profile.education, (value) => updateProfile('education', value), 'e.g. BBA, PMP, relevant certifications', 2)}
+                <div className="search-settings">
+                  <label className="field"><span className="field-label">Posted within *</span>
+                    <select value={profile.timeWindow} onChange={(event) => updateProfile('timeWindow', event.target.value as TimeWindowId)} aria-label="Posted within">
+                      {TIME_WINDOWS.map((window) => <option key={window.id} value={window.id}>{window.label}</option>)}
+                    </select>
+                    <span className="field-hint">Required. Listings older than this, or without a verifiable posting date, are never shown.</span>
+                  </label>
+                  <fieldset className="source-set"><legend className="field-label">Search these sources only *</legend>
+                    {SOURCE_OPTIONS.map((source) => <label key={source.id} className="source-option"><input type="checkbox" checked={profile.sources.includes(source.id)} onChange={() => toggleSource(source.id)} /><span>{source.label}</span></label>)}
+                    <span className="field-hint">Only ticked sources are searched, and only their results are shown. Results come from public search results; open each link on the original site.</span>
+                  </fieldset>
+                </div>
                 <div className="local-note"><ShieldCheck size={16} /><span><strong>Private by default</strong>Your pasted resume and education stay in this browser. Search sends only target roles, skills, location and work preference. The optional Nemotron features send more: query planning uses the same roles, skills and location; “Extract profile with Nemotron AI” sends the resume text when you click it; job explanations send your education and the snippet — plus resume text only if you tick the box above.</span></div>
                 <button className="primary-button full-width" onClick={runSearch} disabled={loading}><Search size={17} /> {loading ? 'Searching the web…' : 'Find matching jobs'} <ArrowRight size={17} /></button>
-                <button className="text-button full-width" onClick={() => { setProfile(DEFAULT_PROFILE); setSearchError(''); setSearchNote('Profile cleared on this device.'); }}>Clear profile</button>
+                <button className="text-button full-width" onClick={() => { setProfile(sanitizeProfile(DEFAULT_PROFILE)); setCvName(''); setSearchError(''); setSearchNote('Profile cleared on this device.'); }}>Clear profile</button>
               </div>}
             </section>
 
