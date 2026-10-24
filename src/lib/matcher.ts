@@ -117,8 +117,10 @@ export function scoreJob(raw: RawJobResult, profile: CareerProfile): JobResult {
   else score += 12;
   if (skills.length > 0) score += Math.round((matchedSkills.length / skills.length) * 40);
   else score += 15;
-  if (location) score += includesTerm(allText, location) ? 15 : 0;
-  else score += 8;
+  if (location) {
+    const locationPart = location.split(',')[0].trim();
+    score += includesTerm(allText, locationPart) ? 15 : 0;
+  } else score += 8;
   if (/\b(job|jobs|career|careers|apply|application|vacancy|vacancies|hiring|position|opening|recruitment)\b/i.test(allText)) score += 5;
   if (matchedEducation.length > 0) score += Math.min(5, matchedEducation.length * 2);
   if (summaryTerms.length > 0) score += Math.min(5, Math.round((matchedSummary.length / Math.min(10, summaryTerms.length)) * 5));
