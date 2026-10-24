@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "tsx --test tests/sample.test.ts",
+    "test": "tsx --test tests/*.test.ts",
     "test:watch": "vitest",
     "dev:vercel": "vercel dev"
   },
