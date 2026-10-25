@@ -1,1 +1,1 @@
-{"runtime": "node-typescript", "scope": {"allowed_paths": ["src/lib/matcher.ts"]}}
+{"runtime": "node-typescript", "scope": {"allowed_paths": ["lib/recency.ts"]}}
