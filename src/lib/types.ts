@@ -7,6 +7,9 @@ export type ApplicationStatus = 'Saved' | 'Applied' | 'Interview' | 'Offer' | 'R
 export interface CareerProfile {
   targetRoles: string;
   skills: string;
+  /** Selected places, e.g. "Mumbai, India" or "Germany". The source of truth. */
+  locations: string[];
+  /** The same places joined with "; ", kept for older backups and the scoring fallback. */
   location: string;
   workMode: WorkMode;
   experienceSummary: string;
@@ -53,6 +56,7 @@ export interface JobSearchResponse {
 export const DEFAULT_PROFILE: CareerProfile = {
   targetRoles: '',
   skills: '',
+  locations: [],
   location: '',
   workMode: 'Any',
   experienceSummary: '',

@@ -21,9 +21,10 @@ A browser-first TypeScript app for discovering potentially relevant jobs, explai
 - **CV upload:** upload a PDF, DOCX or TXT CV (max 5 MB). The text is extracted in the browser with pdf.js and mammoth; the file itself is never uploaded. Scanned/image-only CVs are not supported (paste the text instead).
 - **Mandatory time window:** every search requires one of Last 1 day (24h), 1 week, 2 weeks, 3 weeks or 4 weeks. There is no "all time" option; the server rejects requests without a valid window.
 - **Strict recency:** a listing is shown only if its posting date can be verified (search-provider date, schema.org `datePosted`, or text such as "Posted 3 days ago") and falls inside the window. Listings with no verifiable date are hidden and counted ("Hidden: N without a verifiable posting date"). This favours correctness over volume, so some searches return few results.
-- **User-selected sources only:** tick any of LinkedIn, Indeed, Glassdoor, Naukri and company career sites (Greenhouse, Lever, Workday, Ashby). Only ticked sources are searched and results from any other site are dropped. At least one source is required.
+- **Worldwide, multi-place location search:** pick up to 5 cities or countries from a searchable dropdown (about 23,600 places with 15,000+ inhabitants plus every country; accents and common alternative names such as Bangalore/Bengaluru are understood; “City, Country” works, and any text can be added as a custom place). Each place is searched separately and a listing scores location points if it mentions any selected place.
+- **User-selected sources only (about 90 job sites):** choose from a grouped, searchable list (Global, India, United States & Canada, United Kingdom & Ireland, Europe, Middle East & Africa, Asia-Pacific, Latin America, remote and startup boards, and employer career sites on Greenhouse, Lever, Workday, Ashby and others). Only ticked sources are searched and results from any other site are dropped. At least one source is required.
 - Search across public web results using Tavily through a Vercel Function.
-- At most five bounded Tavily calls per click (one or two queries per ticked source); duplicates are removed and original URLs are preserved.
+- At most eight bounded Tavily calls per click. Ticked sites are grouped (about four per call) and each group is searched once per selected place; with many places and sites the groups are merged, so everything selected is still covered but with fewer result slots per site; duplicates are removed and original URLs are preserved.
 - Local keyword-based ranking with visible matching terms and skills not found in the snippets.
 - **Optional AI explanation (NVIDIA Nemotron on Nebius Token Factory).** Each result has an "Explain with Nemotron" button. A server-side function (`api/analyze-job.ts`) sends the listing snippet plus your target roles, skills, location and education to a Nemotron model and shows strengths, possible gaps and things to verify. Your pasted resume text is sent only if you tick the opt-in box in the profile panel. The AI text is advisory and never changes the keyword match percentage.
 - Save jobs, track `Saved / Applied / Interview / Offer / Rejected`, add a job URL manually, and export/import a JSON backup.
@@ -76,6 +77,10 @@ npm test
 npm run build
 ```
 
+## Data attribution
+
+Place names come from [GeoNames](https://www.geonames.org), licensed under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/), via the `all-the-cities` and `country-list` npm packages (MIT). To regenerate `src/data/places.json`, run `npm install --no-save all-the-cities country-list` and then `node scripts/build-places.mjs`.
+
 ## Important limitations before a public launch
 
 - Matching is a transparent **keyword-overlap estimate** based on a search result's title, URL and short snippet. It is not an AI assessment, a probability of being hired, or a guarantee that the role is open. Users should visit the original listing and verify details.
@@ -94,10 +99,14 @@ src/
   lib/types.ts            Shared type definitions
   lib/matcher.ts          URL normalization, simple matching, fallback links
   lib/cv.ts               Browser-side CV text extraction (PDF, DOCX, TXT)
-  lib/window.ts           Time-window and source options for the UI
+  lib/window.ts           Time-window options for the UI
+  lib/locations.ts        Worldwide place search (cities and countries)
+  components/             LocationPicker and SourcePicker multi-selects
+  data/places.json        Generated place data (GeoNames, CC BY 4.0)
   test/matcher.test.ts    Matcher tests
   styles.css              Responsive UI styles
 lib/
+  sources.ts              Catalogue of job sites and their domains (shared by browser and server)
   recency.ts              Server-side posting-date detection, time windows, portal domains
 api/
   search-jobs.ts          Vercel Function: server-side Tavily search proxy

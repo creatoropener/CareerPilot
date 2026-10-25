@@ -117,9 +117,12 @@ export function scoreJob(raw: RawJobResult, profile: CareerProfile): JobResult {
   else score += 12;
   if (skills.length > 0) score += Math.round((matchedSkills.length / skills.length) * 40);
   else score += 15;
-  if (location) {
-    const locationPart = location.split(',')[0].trim();
-    score += includesTerm(allText, locationPart) ? 15 : 0;
+  // Several places can be selected; a listing earns the location points when it mentions any of them.
+  // Profiles without the list (older backups) fall back to the single location text.
+  const places = (profile.locations ?? []).map((entry) => entry.trim()).filter(Boolean);
+  if (places.length === 0 && location) places.push(location);
+  if (places.length > 0) {
+    score += places.some((place) => includesTerm(allText, place.split(',')[0].trim())) ? 15 : 0;
   } else score += 8;
   if (/\b(job|jobs|career|careers|apply|application|vacancy|vacancies|hiring|position|opening|recruitment)\b/i.test(allText)) score += 5;
   if (matchedEducation.length > 0) score += Math.min(5, matchedEducation.length * 2);

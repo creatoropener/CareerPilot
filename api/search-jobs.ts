@@ -1,10 +1,12 @@
 // Vercel Function: POST /api/search-jobs
-// Searches ONLY the portals the user ticked and returns ONLY listings whose posting date can be verified
-// to fall inside the chosen time window.
+// Searches ONLY the sites the user ticked, once per selected place, and returns ONLY listings whose posting
+// date can be verified to fall inside the chosen time window.
 // Proxies a small set of search terms to Tavily so the API key never reaches the browser.
 
-import { findPostedDate, hostMatches, isSourceId, isTimeWindowId, isWithinWindow, SOURCE_DOMAINS, toDateOnly, WINDOW_DAYS } from '../lib/recency.js';
-import type { SourceId, TimeWindowId } from '../lib/recency.js';
+import { findPostedDate, hostMatches, isTimeWindowId, isWithinWindow, toDateOnly, WINDOW_DAYS } from '../lib/recency.js';
+import type { TimeWindowId } from '../lib/recency.js';
+import { ATS_GROUP, getSource, isSourceId } from '../lib/sources.js';
+import type { SourceDef } from '../lib/sources.js';
 
 interface SearchRequest {
   timeWindow?: string;
@@ -12,6 +14,7 @@ interface SearchRequest {
   targetRoles?: string;
   skills?: string;
   location?: string;
+  locations?: unknown;
   workMode?: string;
 }
 
@@ -35,6 +38,12 @@ const NEBIUS_DEFAULT_BASE_URL = 'https://api.tokenfactory.nebius.com/v1';
 const NEBIUS_DEFAULT_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
 const PLANNER_TIMEOUT_MS = 15_000;
 
+// One click runs at most MAX_CALLS Tavily searches in total, however many places and sites are selected.
+const MAX_CALLS = 8;
+const MAX_PLACES = 5;
+const SOURCES_PER_CALL = 4;
+const LOCATION_TOKEN = '{location}';
+
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 const json = (body: unknown, status = 200, extra: Record<string, string> = {}): Response =>
@@ -48,11 +57,10 @@ const cleanField = (value: unknown): string => typeof value === 'string'
 function makeQueries(profile: SearchRequest): string[] {
   const roles = cleanField(profile.targetRoles).split(/[\n,;|]/).map((part) => part.trim()).filter(Boolean).slice(0, 2);
   const skills = cleanField(profile.skills).split(/[\n,;|]/).map((part) => part.trim()).filter(Boolean).slice(0, 5);
-  const location = cleanField(profile.location);
   const mode = cleanField(profile.workMode);
   const primaryRole = roles[0] || 'professional';
   const rolePhrase = roles.length > 1 ? `"${roles[0]}" OR "${roles[1]}"` : `"${primaryRole}"`;
-  const locationPart = location ? `"${location}"` : '';
+  const locationPart = LOCATION_TOKEN; // replaced by each selected place when the searches are built
   const modePart = mode && mode !== 'Any' ? mode : '';
   const skillPart = skills.slice(0, 3).map((skill) => `"${skill}"`).join(' ');
   return [
@@ -63,10 +71,11 @@ function makeQueries(profile: SearchRequest): string[] {
 }
 
 const PLANNER_PROMPT = `You plan web searches that find CURRENT job vacancies for a candidate.
-Given target roles, skills, preferred location and work mode, write exactly 3 short search queries (each under 200 characters):
-1. a plain query for open positions using the main target title and location;
-2. a query using realistic alternative or adjacent job titles (synonyms, seniority variants) plus the location;
-3. a query aimed at employer career pages or applicant-tracking sites (Greenhouse, Lever, Workday) combining title, key skills and location.
+Given target roles, skills and work mode, write exactly 3 short search queries (each under 200 characters).
+Write the literal text {location} where the place name belongs; the system replaces it with each place the candidate selected. Never write real place names yourself.
+1. a plain query for open positions using the main target title and {location};
+2. a query using realistic alternative or adjacent job titles (synonyms, seniority variants) plus {location};
+3. a query aimed at employer career pages or applicant-tracking sites (Greenhouse, Lever, Workday) combining title, key skills and {location}.
 Do not invent employers. Do not add personal data. Respond with a single JSON object and nothing else: {"queries":["...","...","..."]}`;
 
 // Asks an NVIDIA Nemotron model (Nebius Token Factory) to plan the searches. Returns [] on any problem,
@@ -89,7 +98,6 @@ async function planQueries(profile: SearchRequest): Promise<string[]> {
           { role: 'user', content: [
             `Target roles: ${cleanField(profile.targetRoles)}`,
             `Skills: ${cleanField(profile.skills) || 'not provided'}`,
-            `Preferred location: ${cleanField(profile.location) || 'not provided'}`,
             `Work mode: ${cleanField(profile.workMode) || 'Any'}`,
           ].join('\n') },
         ],
@@ -123,6 +131,7 @@ interface SearchOptions {
   window: TimeWindowId;
   now: Date;
   domains: string[];
+  maxResults: number;
 }
 
 async function runSearch(query: string, apiKey: string, options: SearchOptions): Promise<TavilyResult[]> {
@@ -135,7 +144,7 @@ async function runSearch(query: string, apiKey: string, options: SearchOptions):
       query,
       topic: 'general',
       search_depth: 'basic',
-      max_results: 10,
+      max_results: options.maxResults,
       include_answer: false,
       // raw content is only read on the server to find a posting date; it is never sent to the browser.
       include_raw_content: 'text',
@@ -160,20 +169,76 @@ function canonicalKey(url: string): string {
 interface SearchJob {
   query: string;
   domains: string[];
+  maxResults: number;
 }
 
-// One call per (portal, query). Portals use the two general queries; ATS pages use the third.
-// The total is bounded to 5 calls so one click cannot burn many API credits.
-function buildJobs(sources: SourceId[], queries: string[]): SearchJob[] {
-  const portals = sources.filter((source) => source !== 'ats');
-  const jobs: SearchJob[] = [];
-  const perPortal = portals.length <= 2 ? 2 : 1;
-  for (const portal of portals) {
-    for (const query of queries.slice(0, perPortal)) jobs.push({ query, domains: [SOURCE_DOMAINS[portal][0]] });
-    if (SOURCE_DOMAINS[portal].length > 1 && perPortal === 1) jobs.push({ query: queries[0], domains: [SOURCE_DOMAINS[portal][1]] });
+/** Reads the selected places: the new list, or the older single "location" text. */
+function parseLocations(profile: SearchRequest): string[] {
+  const raw: unknown[] = Array.isArray(profile.locations) ? profile.locations : cleanField(profile.location).split(/[;\n|]/);
+  const seen = new Set<string>();
+  const places: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    // Quotes and braces are removed so a place name cannot alter the query syntax or the {location} token.
+    const label = cleanField(item).replace(/["{}]/g, '').replace(/\s+/g, ' ').trim().slice(0, 100);
+    if (label.length < 2 || seen.has(label.toLowerCase())) continue;
+    seen.add(label.toLowerCase());
+    places.push(label);
+    if (places.length === MAX_PLACES) break;
   }
-  if (sources.includes('ats')) jobs.push({ query: queries[2] ?? queries[0], domains: SOURCE_DOMAINS.ats });
-  return jobs.slice(0, 5);
+  return places;
+}
+
+// "Mumbai, India" -> "Mumbai" India (city quoted, country loose); "India" -> "India".
+function locationTerm(label: string): string {
+  if (!label) return '';
+  const [city, ...rest] = label.split(',');
+  return rest.length ? `"${city.trim()}" ${rest.join(' ').trim()}` : `"${label}"`;
+}
+
+function fillLocation(query: string, term: string): string {
+  const filled = query.includes(LOCATION_TOKEN) ? query.split(LOCATION_TOKEN).join(term) : `${query} ${term}`;
+  return filled.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Plans the Tavily calls. Sources are grouped (about four per call) and each group is searched once per place.
+ * The total never exceeds MAX_CALLS: when many places are selected, groups are merged so every place and every
+ * ticked site is still covered, just with fewer result slots per site.
+ */
+function buildJobs(sources: SourceDef[], queries: string[], places: string[]): SearchJob[] {
+  const targets = places.length ? places : [''];
+  const perPlace = Math.max(1, Math.floor(MAX_CALLS / targets.length));
+  const ats = sources.filter((source) => source.group === ATS_GROUP);
+  const portals = sources.filter((source) => source.group !== ATS_GROUP);
+
+  const groups: { sources: SourceDef[]; query: string }[] = [];
+  if (perPlace === 1) {
+    groups.push({ sources, query: queries[0] });
+  } else {
+    const portalCalls = portals.length ? Math.min(perPlace - (ats.length ? 1 : 0), Math.ceil(portals.length / SOURCES_PER_CALL)) : 0;
+    const buckets: SourceDef[][] = Array.from({ length: portalCalls }, () => []);
+    portals.forEach((source, index) => buckets[index % portalCalls].push(source));
+    buckets.forEach((bucket) => groups.push({ sources: bucket, query: queries[0] }));
+    if (ats.length) groups.push({ sources: ats, query: queries[2] ?? queries[0] });
+    // Spare budget: repeat the portal groups with the second (alternative titles) query.
+    for (const bucket of buckets) {
+      if (groups.length >= perPlace || !queries[1]) break;
+      groups.push({ sources: bucket, query: queries[1] });
+    }
+  }
+
+  const jobs: SearchJob[] = [];
+  for (const place of targets) {
+    for (const group of groups) {
+      jobs.push({
+        query: fillLocation(group.query, locationTerm(place)),
+        domains: [...new Set(group.sources.flatMap((source) => source.domains))],
+        maxResults: Math.min(20, 8 + 3 * group.sources.length),
+      });
+    }
+  }
+  return jobs.slice(0, MAX_CALLS);
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -198,9 +263,10 @@ export async function POST(request: Request): Promise<Response> {
   }
   const window: TimeWindowId = profile.timeWindow;
 
-  const sources = Array.isArray(profile.sources)
-    ? [...new Set(profile.sources.filter((source): source is SourceId => isSourceId(source)))]
+  const sourceIds = Array.isArray(profile.sources)
+    ? [...new Set(profile.sources.filter((source): source is string => isSourceId(source)))]
     : [];
+  const sources = sourceIds.flatMap((id) => getSource(id) ?? []);
   if (sources.length === 0) {
     return json({ error: 'Select at least one job source to search.' }, 400);
   }
@@ -213,9 +279,9 @@ export async function POST(request: Request): Promise<Response> {
   const cleanProfile: SearchRequest = {
     targetRoles,
     skills: cleanField(profile.skills),
-    location: cleanField(profile.location),
     workMode: cleanField(profile.workMode),
   };
+  const places = parseLocations(profile);
   const ruleQueries = makeQueries(cleanProfile);
   const planned = await planQueries(cleanProfile);
   // Nemotron-planned queries first; any missing slots are filled by the rule-based ones.
@@ -223,9 +289,9 @@ export async function POST(request: Request): Promise<Response> {
   const planner = planned.length > 0 ? 'nemotron' : 'rules';
 
   const now = new Date();
-  const jobs = buildJobs(sources, queries);
+  const jobs = buildJobs(sources, queries, places);
   // allSettled so one slow or failing query does not throw away the others.
-  const settled = await Promise.allSettled(jobs.map((job) => runSearch(job.query, apiKey, { window, now, domains: job.domains })));
+  const settled = await Promise.allSettled(jobs.map((job) => runSearch(job.query, apiKey, { window, now, domains: job.domains, maxResults: job.maxResults })));
   const fulfilled = settled.filter((entry): entry is PromiseFulfilledResult<TavilyResult[]> => entry.status === 'fulfilled');
   if (fulfilled.length === 0) {
     const first = settled.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
@@ -233,7 +299,7 @@ export async function POST(request: Request): Promise<Response> {
     return json({ error: `Job search failed. ${message}` }, 502);
   }
 
-  const allowedDomains = sources.flatMap((source) => SOURCE_DOMAINS[source]);
+  const allowedDomains = sources.flatMap((source) => source.domains);
   const excluded = { otherSource: 0, undated: 0, tooOld: 0, invalid: 0 };
   const seen = new Set<string>();
   const results = [];
@@ -267,7 +333,8 @@ export async function POST(request: Request): Promise<Response> {
     });
   }
 
-  return json({ results, queriesRun: fulfilled.length, queries, planner, timeWindow: window, sources, excluded }, 200, { 'Cache-Control': 'no-store' });
+  const queriesSent = [...new Set(jobs.map((job) => job.query))];
+  return json({ results, queriesRun: fulfilled.length, queries: queriesSent, planner, timeWindow: window, sources: sourceIds, locations: places, excluded }, 200, { 'Cache-Control': 'no-store' });
 }
 
 export function GET(): Response {

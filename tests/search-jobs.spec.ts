@@ -31,7 +31,7 @@ describe('POST /api/search-jobs', () => {
   it('requires at least one valid source', async () => {
     mockFetch([]);
     expect((await POST(request({ ...base, sources: [] }))).status).toBe(400);
-    expect((await POST(request({ ...base, sources: ['monster'] }))).status).toBe(400);
+    expect((await POST(request({ ...base, sources: ['not-a-real-site'] }))).status).toBe(400);
     expect((await POST(request({ ...base, sources: undefined }))).status).toBe(400);
   });
 
@@ -71,10 +71,11 @@ describe('POST /api/search-jobs', () => {
 
   it('uses Nemotron-planned queries when available and falls back otherwise', async () => {
     process.env.NEBIUS_API_KEY = 'nb';
-    const planned = mockFetch([], () => new Response(JSON.stringify({ choices: [{ message: { content: '{"queries":["supply chain manager openings Mumbai","logistics head vacancy Mumbai","greenhouse supply chain Mumbai"]}' } }] }), { status: 200 }));
+    const planned = mockFetch([], () => new Response(JSON.stringify({ choices: [{ message: { content: '{"queries":["supply chain manager openings {location}","logistics head vacancy {location}","greenhouse supply chain {location}"]}' } }] }), { status: 200 }));
     const data = await (await POST(request(base))).json() as { planner: string };
     expect(data.planner).toBe('nemotron');
-    expect(planned.map((call) => call.query)).toContain('logistics head vacancy Mumbai');
+    expect(planned.map((call) => call.query)).toContain('logistics head vacancy "Mumbai"');
+    expect(planned.every((call) => !call.query.includes('{location}'))).toBe(true);
     vi.restoreAllMocks();
     mockFetch([], () => new Response('down', { status: 503 }));
     expect(((await (await POST(request(base))).json()) as { planner: string }).planner).toBe('rules');

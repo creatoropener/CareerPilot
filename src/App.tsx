@@ -9,8 +9,11 @@ import { buildSearchFallbackLinks, canonicalizeUrl, domainOf, makeJobId, rankJob
 import { DEFAULT_PROFILE, STATUS_OPTIONS } from './lib/types';
 import type { AiAnalysis, ApplicationStatus, CareerProfile, JobResult, JobSearchResponse, RawJobResult, WorkMode } from './lib/types';
 import { CvError, extractCvText } from './lib/cv';
-import { DEFAULT_SOURCES, DEFAULT_TIME_WINDOW, isPostedWithin, isSourceId, isTimeWindowId, SOURCE_OPTIONS, TIME_WINDOWS, windowLabel } from './lib/window';
-import type { SourceId, TimeWindowId } from './lib/window';
+import { DEFAULT_SOURCES, DEFAULT_TIME_WINDOW, isPostedWithin, isSourceId, isTimeWindowId, TIME_WINDOWS, windowLabel } from './lib/window';
+import type { TimeWindowId } from './lib/window';
+import { cleanCustomLocation, MAX_LOCATIONS, splitLegacyLocation } from './lib/locations';
+import { LocationPicker } from './components/LocationPicker';
+import { SourcePicker } from './components/SourcePicker';
 import './styles.css';
 
 const PROFILE_KEY = 'careerpilot.job-radar.profile.v1';
@@ -28,11 +31,16 @@ function readLocal<T>(key: string, fallback: T): T {
   }
 }
 
-// Stored or imported profiles may predate the time-window and source settings, or be malformed.
+// Stored or imported profiles may predate the time-window, source and multi-location settings, or be malformed.
 function sanitizeProfile(value: CareerProfile): CareerProfile {
   const sources = Array.isArray(value.sources) ? [...new Set(value.sources.filter(isSourceId))] : [];
+  const saved = Array.isArray(value.locations) ? value.locations.filter((item): item is string => typeof item === 'string').map(cleanCustomLocation).filter(Boolean) : [];
+  // Older profiles only have the single "location" text: split it into entries.
+  const locations = [...new Set(saved.length ? saved : splitLegacyLocation(typeof value.location === 'string' ? value.location : ''))].slice(0, MAX_LOCATIONS);
   return {
     ...value,
+    locations,
+    location: locations.join('; '),
     timeWindow: isTimeWindowId(value.timeWindow) ? value.timeWindow : DEFAULT_TIME_WINDOW,
     sources: sources.length ? sources : [...DEFAULT_SOURCES],
   };
@@ -131,7 +139,7 @@ function App() {
     try { localStorage.setItem(JOBS_KEY, JSON.stringify(savedJobs)); } catch { /* storage can be disabled */ }
   }, [savedJobs]);
 
-  const fallbackLinks = useMemo(() => buildSearchFallbackLinks(profile), [profile]);
+  const fallbackLinks = useMemo(() => buildSearchFallbackLinks({ ...profile, location: profile.locations[0] ?? '' }), [profile]);
   const visibleResults = useMemo(() => {
     if (filter === 'strong') return results.filter((job) => job.matchScore >= 70);
     if (filter === 'medium') return results.filter((job) => job.matchScore >= 40 && job.matchScore < 70);
@@ -179,11 +187,8 @@ function App() {
     }
   }
 
-  function toggleSource(id: SourceId) {
-    setProfile((current) => {
-      const has = current.sources.includes(id);
-      return { ...current, sources: has ? current.sources.filter((source) => source !== id) : [...current.sources, id] };
-    });
+  function updateLocations(locations: string[]) {
+    setProfile((current) => ({ ...current, locations, location: locations.join('; ') }));
   }
 
   async function extractWithNemotron() {
@@ -208,7 +213,9 @@ function App() {
         targetRoles: current.targetRoles.trim() || found.targetRoles.join(', '),
         skills: [...new Set([...current.skills.split(/[,;\n|]/).map((item) => item.trim()).filter(Boolean), ...found.skills])].join(', '),
         education: current.education.trim() || found.education.join(' · '),
-        location: current.location.trim() || found.location,
+        ...(current.locations.length === 0 && found.location.trim()
+          ? { locations: [cleanCustomLocation(found.location)], location: cleanCustomLocation(found.location) }
+          : {}),
       }));
       setSearchNote(`Nemotron found ${found.targetRoles.length} role title(s), ${found.skills.length} skill(s) and ${found.education.length} education line(s)${found.headline ? ` — “${found.headline}”` : ''}. Review the profile before searching.`);
     } catch (error) {
@@ -236,7 +243,7 @@ function App() {
     setLoading(true);
     setSearchError('');
     setSearchNote('Searching public web results and ranking the available snippets…');
-    setQueryLabel([profile.targetRoles.split(/[\n,;|]/)[0], profile.location].filter(Boolean).join(' · '));
+    setQueryLabel([profile.targetRoles.split(/[\n,;|]/)[0], profile.locations.join(', ')].filter(Boolean).join(' · '));
     setFilter('all');
     try {
       const response = await fetch('/api/search-jobs', {
@@ -245,7 +252,8 @@ function App() {
         body: JSON.stringify({
           targetRoles: profile.targetRoles,
           skills: profile.skills,
-          location: profile.location,
+          location: profile.locations.join('; '),
+          locations: profile.locations,
           workMode: profile.workMode,
           timeWindow: windowId,
           sources: profile.sources,
@@ -286,7 +294,7 @@ function App() {
         profile: {
           targetRoles: profile.targetRoles,
           skills: profile.skills,
-          location: profile.location,
+          location: profile.locations.join('; '),
           education: profile.education,
           // The resume/experience text is only included when the user ticks the opt-in box.
           resumeText: aiIncludeResume ? profile.experienceSummary : '',
@@ -430,7 +438,7 @@ function App() {
               {showProfileForm && <div className="profile-form">
                 {field('Target job titles', 'Separate multiple titles with commas.', profile.targetRoles, (value) => updateProfile('targetRoles', value), 'e.g. Operations Manager, Supply Chain Analyst', 2)}
                 {field('Skills & tools', 'Use the skills you can demonstrate.', profile.skills, (value) => updateProfile('skills', value), 'e.g. SAP S/4HANA, Excel, freight auditing', 3)}
-                {field('Preferred location', 'City, region or country.', profile.location, (value) => updateProfile('location', value), 'e.g. Mumbai, India')}
+                <LocationPicker value={profile.locations} onChange={updateLocations} />
                 <label className="field"><span className="field-label">Work preference</span><select value={profile.workMode} onChange={(event) => updateProfile('workMode', event.target.value as WorkMode)}><option>Any</option><option>Remote</option><option>Hybrid</option><option>On-site</option></select></label>
                 <div className="cv-upload">
                   <button type="button" className="secondary-button full-width" onClick={() => cvInput.current?.click()} disabled={cvLoading}><FileUp size={15} /> {cvLoading ? 'Reading CV…' : cvName ? `Replace CV (${cvName})` : 'Upload CV (PDF, DOCX or TXT)'}</button>
@@ -450,10 +458,7 @@ function App() {
                     </select>
                     <span className="field-hint">Required. Listings older than this, or without a verifiable posting date, are never shown.</span>
                   </label>
-                  <fieldset className="source-set"><legend className="field-label">Search these sources only *</legend>
-                    {SOURCE_OPTIONS.map((source) => <label key={source.id} className="source-option"><input type="checkbox" checked={profile.sources.includes(source.id)} onChange={() => toggleSource(source.id)} /><span>{source.label}</span></label>)}
-                    <span className="field-hint">Only ticked sources are searched, and only their results are shown. Results come from public search results; open each link on the original site.</span>
-                  </fieldset>
+                  <SourcePicker value={profile.sources} onChange={(sources) => setProfile((current) => ({ ...current, sources }))} />
                 </div>
                 <div className="local-note"><ShieldCheck size={16} /><span><strong>Private by default</strong>Your pasted resume and education stay in this browser. Search sends only target roles, skills, location and work preference. The optional Nemotron features send more: query planning uses the same roles, skills and location; “Extract profile with Nemotron AI” sends the resume text when you click it; job explanations send your education and the snippet — plus resume text only if you tick the box above.</span></div>
                 <button className="primary-button full-width" onClick={runSearch} disabled={loading}><Search size={17} /> {loading ? 'Searching the web…' : 'Find matching jobs'} <ArrowRight size={17} /></button>
