@@ -44,19 +44,18 @@ const RELATIVE = /\b(\d{1,3})(\+)?\s*(minute|hour|day|week|month)s?\s+ago\b/gi;
  * For relative phrases the OLDEST match wins, so ambiguity can only make us stricter.
  */
 export function findPostedDate(input: { publishedDate?: string | null; text: string }, now = new Date()): PostedDate | null {
-  const candidates: Date[] = [];
-
   if (input.publishedDate) {
     const date = validDate(input.publishedDate, now);
-    if (date) candidates.push(date);
+    if (date) return { date, source: 'api' };
   }
 
   const structured = /"datePosted"\s*:\s*"([^"]{6,40})"/i.exec(input.text);
   if (structured) {
     const date = validDate(structured[1], now);
-    if (date) candidates.push(date);
+    if (date) return { date, source: 'structured-data' };
   }
 
+  const candidates: Date[] = [];
   const text = input.text;
   for (const match of text.matchAll(POSTED_ABSOLUTE)) {
     const date = validDate(match[1].replace(/(\d)(st|nd|rd|th)\b/i, '$1'), now);
@@ -71,19 +70,7 @@ export function findPostedDate(input: { publishedDate?: string | null; text: str
 
   if (candidates.length === 0) return null;
   const oldest = candidates.reduce((a, b) => (a.getTime() <= b.getTime() ? a : b));
-  
-  // Determine source of the oldest date
-  let source: 'api' | 'structured-data' | 'text' = 'text';
-  if (input.publishedDate) {
-    const apiDate = validDate(input.publishedDate, now);
-    if (apiDate && apiDate.getTime() === oldest.getTime()) source = 'api';
-  }
-  if (source === 'text' && structured) {
-    const structDate = validDate(structured[1], now);
-    if (structDate && structDate.getTime() === oldest.getTime()) source = 'structured-data';
-  }
-  
-  return { date: oldest, source };
+  return { date: oldest, source: 'text' };
 }
 
 export function isWithinWindow(date: Date, window: TimeWindowId, now = new Date()): boolean {
