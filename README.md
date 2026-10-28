@@ -6,7 +6,7 @@ Built for the **Nebius x NVIDIA Global AI Hackathon**, track **Best Apps and Age
 
 | | |
 |---|---|
-| **Live demo** | `https://YOUR-APP.vercel.app` |
+| **Live demo** | https://career-pilot-ivory.vercel.app/ |
 | **Code** | https://github.com/creatoropener/CareerPilot |
 | **License** | MIT (see [`LICENSE`](LICENSE)) |
 
