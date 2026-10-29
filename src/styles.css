@@ -364,3 +364,6 @@ p.picker-note { margin: 0; }
 .picker .source-option input[type="checkbox"] { width: 15px; height: 15px; padding: 0; margin: 1px 0 0; flex-shrink: 0; accent-color: #3563e9; }
 .picker .source-option span { min-width: 0; overflow-wrap: anywhere; }
 @media (max-width: 620px) { .picker-list { top: calc(100% - 22px); } .picker-groups { max-height: 260px; } }
+
+.more-row { display: flex; justify-content: center; margin: 18px 0 6px; }
+.more-button { min-width: 200px; justify-content: center; gap: 8px; }

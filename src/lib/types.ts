@@ -24,6 +24,8 @@ export interface RawJobResult {
   content: string;
   score?: number;
   publishedDate?: string | null;
+  /** Stable identity of the posting (from the search function), used to avoid showing it twice. */
+  key?: string;
 }
 
 export interface JobResult extends RawJobResult {
@@ -50,7 +52,24 @@ export interface JobSearchResponse {
   queriesRun: number;
   queries?: string[];
   planner?: 'nemotron' | 'rules';
-  excluded?: { otherSource: number; undated: number; tooOld: number; invalid: number };
+  page?: number;
+  /** Valid listings beyond the pool the server returns. */
+  overflow?: number;
+  excluded?: SearchExclusions;
+}
+
+/** Why results from the search provider were left out of a search. */
+export interface SearchExclusions {
+  otherSource: number;
+  undated: number;
+  tooOld: number;
+  invalid: number;
+  /** Search pages, category pages and "N vacancies" pages. */
+  notVacancy: number;
+  /** Listings for a place other than the selected ones. */
+  wrongLocation: number;
+  alreadyShown: number;
+  duplicate: number;
 }
 
 export const DEFAULT_PROFILE: CareerProfile = {

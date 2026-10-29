@@ -48,25 +48,25 @@ describe('POST /api/search-jobs', () => {
 
   it('keeps only dated, in-window listings from the ticked portals', async () => {
     mockFetch([
-      { title: 'fresh', url: 'https://in.indeed.com/viewjob?jk=1', content: 'x', published_date: daysAgo(2) },
-      { title: 'old', url: 'https://in.indeed.com/viewjob?jk=2', content: 'x', published_date: daysAgo(20) },
-      { title: 'undated', url: 'https://www.naukri.com/job-3', content: 'No date here' },
-      { title: 'text-dated', url: 'https://www.naukri.com/job-4', content: 'Posted 3 days ago' },
-      { title: 'text-old', url: 'https://www.naukri.com/job-5', content: 'Posted 3 weeks ago' },
-      { title: 'other portal', url: 'https://www.linkedin.com/jobs/view/6', content: 'x', published_date: daysAgo(1) },
+      { title: 'Planner - Acme - Mumbai - Indeed.com', url: 'https://in.indeed.com/viewjob?jk=1', content: 'Mumbai, India', published_date: daysAgo(2) },
+      { title: 'Buyer - Beta - Mumbai - Indeed.com', url: 'https://in.indeed.com/viewjob?jk=2', content: 'Mumbai, India', published_date: daysAgo(20) },
+      { title: 'Analyst - Gamma - Mumbai | Naukri.com', url: 'https://www.naukri.com/job-listings-analyst-gamma-mumbai-123456', content: 'Mumbai. No date here' },
+      { title: 'Manager - Delta - Mumbai | Naukri.com', url: 'https://www.naukri.com/job-listings-manager-delta-mumbai-234567', content: 'Mumbai. Posted 3 days ago' },
+      { title: 'Lead - Eps - Mumbai | Naukri.com', url: 'https://www.naukri.com/job-listings-lead-eps-mumbai-345678', content: 'Mumbai. Posted 3 weeks ago' },
+      { title: 'Eta hiring Planner in Mumbai | LinkedIn', url: 'https://www.linkedin.com/jobs/view/planner-at-eta-3812345678', content: 'Mumbai', published_date: daysAgo(1) },
     ]);
     const data = await (await POST(request(base))).json() as { results: { title: string }[]; excluded: Record<string, number> };
-    expect(data.results.map((job) => job.title).sort()).toEqual(['fresh', 'text-dated']);
+    expect(data.results.map((job) => job.title).sort()).toEqual(['Manager — Delta', 'Planner — Acme']);
     expect(data.excluded).toMatchObject({ otherSource: 1, undated: 1, tooOld: 2 });
   });
 
   it('applies the chosen window strictly (1 day)', async () => {
     mockFetch([
-      { title: 'today', url: 'https://www.naukri.com/a', content: 'Posted 5 hours ago' },
-      { title: 'two days', url: 'https://www.naukri.com/b', content: 'Posted 2 days ago' },
+      { title: 'Planner - Acme - Mumbai | Naukri.com', url: 'https://www.naukri.com/job-listings-planner-acme-mumbai-111111', content: 'Mumbai. Posted 5 hours ago' },
+      { title: 'Buyer - Beta - Mumbai | Naukri.com', url: 'https://www.naukri.com/job-listings-buyer-beta-mumbai-222222', content: 'Mumbai. Posted 2 days ago' },
     ]);
     const data = await (await POST(request({ ...base, timeWindow: '1d', sources: ['naukri'] }))).json() as { results: { title: string }[] };
-    expect(data.results.map((job) => job.title)).toEqual(['today']);
+    expect(data.results.map((job) => job.title)).toEqual(['Planner — Acme']);
   });
 
   it('uses Nemotron-planned queries when available and falls back otherwise', async () => {

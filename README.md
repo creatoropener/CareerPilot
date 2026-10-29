@@ -21,8 +21,13 @@ Built for the **Nebius x NVIDIA Global AI Hackathon**, track **Best Apps and Age
    - **Locations:** pick up to 5 places from a searchable worldwide list (about 23,600 cities plus every country). Accents and common alternative names work (Bangalore finds Bengaluru), "City, Country" works, and you can type any custom place.
    - **Sources:** pick from 97 job sites in a grouped, searchable list: global boards, India, US and Canada, UK and Ireland, Europe, Middle East and Africa, Asia-Pacific, Latin America, remote and startup boards, and employer career pages (Greenhouse, Lever, Workday, Ashby and more). Only the sites you tick are searched; results from any other site are dropped.
 3. **Pick a mandatory time window:** last 1 day, 1 week, 2, 3 or 4 weeks. There is no "all time" option, and the server rejects a search without a valid window.
-4. **Search.** Nemotron plans the search queries; Tavily fetches public results. A listing is shown only if a posting date inside your window can be verified. Listings with no verifiable date are hidden and counted, so the app favours freshness over volume.
-5. **Review ranked results.** Each result is de-duplicated, links to the original listing, and shows a keyword match score with the matching terms and the skills not found in the listing.
+4. **Search.** Nemotron plans the search queries (the city and the country are both quoted in every query); Tavily fetches public results. Every result is then checked before you see it:
+   - **Place:** it must be for one of your selected places. A listing from another city (for example Kochi when you chose Navi Mumbai) or another country is dropped.
+   - **One vacancy:** it must be a single job posting, not a search page, a category page or a "15,000 vacancies" page.
+   - **Date:** a posting date inside your window must be verifiable. Listings with no verifiable date are hidden.
+   - **Duplicates:** the same job found twice (or on two sites) appears once.
+   The status line says how many results were left out and why, so a search with fewer than 10 results is always explained.
+5. **Review ranked results.** Up to **10** listings are shown at a time, titled "Role — Company", with a link to the original listing, a keyword match score, the matching terms and the skills not found in the listing. The **Search More Jobs** button shows the next 10 already found, then runs one more different search (at most 4 searches in total), then disappears when nothing new is found.
 6. **Ask Nemotron why.** *Explain with Nemotron* gives strengths, possible gaps and things to verify before applying. It never changes the score.
 7. **Track applications.** Save jobs and move them through Saved, Applied, Interview, Offer and Rejected. Add a job by URL, and export or restore a JSON backup.
 
@@ -69,7 +74,7 @@ flowchart LR
 
 Privacy by design: the profile and saved jobs stay in `localStorage`. The search request carries only target roles, skills, locations and work mode. CV text reaches the model only when you click an AI button, and your resume is included in job explanations only if you tick the opt-in box.
 
-Cost control: at most **8 Tavily calls per search click**. Selected sites are grouped (about four per call) and each group is searched per selected place; with many places and sites the groups are merged, so everything selected is still covered with fewer result slots per site. The AI endpoints have a best-effort per-IP rate limit.
+Cost control: at most **8 Tavily calls for a new search** and 5 for each "Search More Jobs" search, with no retries to "fill up" a count. Selected sites are grouped (about four per call) and each group is searched per selected place; with many places and sites the groups are merged, so everything selected is still covered with fewer result slots per site. The AI endpoints have a best-effort per-IP rate limit.
 
 ---
 
@@ -162,10 +167,12 @@ api/
 lib/
   sources.ts            Catalogue of 97 job sites and their domains (shared by browser and server)
   recency.ts            Posting-date detection, time windows, domain matching
+  geo.ts                Checks that a listing is for a selected city or country
+  listings.ts           Single-vacancy check, "Role — Company" titles, duplicate keys
 src/
   App.tsx               UI, profile, results and application tracker
   components/           LocationPicker and SourcePicker multi-selects
-  lib/                  Matcher, CV text extraction, locations, time windows, types
+  lib/                  Matcher, CV text extraction, locations, time windows, paging, types
   data/places.json      Generated place data (GeoNames)
 scripts/build-places.mjs  Regenerates places.json
 tests/                  node:test (*.test.ts) and vitest (*.spec.ts) suites

@@ -50,8 +50,8 @@ describe('POST /api/search-jobs with several places and sites', () => {
     const data = await (await POST(request({ ...base, sources: ['indeed'], locations: ['Mumbai, India', 'Dubai, United Arab Emirates', 'Germany'] }))).json() as { locations: string[] };
     expect(data.locations).toEqual(['Mumbai, India', 'Dubai, United Arab Emirates', 'Germany']);
     const text = sent.map((call) => call.query).join('\n');
-    expect(text).toContain('"Mumbai" India');
-    expect(text).toContain('"Dubai" United Arab Emirates');
+    expect(text).toContain('"Mumbai" "India"');
+    expect(text).toContain('"Dubai" "United Arab Emirates"');
     expect(text).toContain('"Germany"');
     expect(sent.every((call) => !call.query.includes('{location}'))).toBe(true);
   });
@@ -76,7 +76,7 @@ describe('POST /api/search-jobs with several places and sites', () => {
   it('works with the older single "location" text and with no place at all', async () => {
     let sent = mockTavily();
     await POST(request({ ...base, sources: ['indeed'], location: 'Mumbai, India' }));
-    expect(sent.map((call) => call.query).join(' ')).toContain('"Mumbai" India');
+    expect(sent.map((call) => call.query).join(' ')).toContain('"Mumbai" "India"');
     vi.restoreAllMocks();
     sent = mockTavily();
     const data = await (await POST(request({ ...base, sources: ['indeed'] }))).json() as { locations: string[] };

@@ -1,12 +1,18 @@
 // Vercel Function: POST /api/search-jobs
-// Searches ONLY the sites the user ticked, once per selected place, and returns ONLY listings whose posting
-// date can be verified to fall inside the chosen time window.
+// Searches ONLY the sites the user ticked, once per selected place, and returns ONLY individual vacancies that
+//  - are on a ticked site,
+//  - are for one of the selected places (a listing from another city or country is dropped),
+//  - are a single posting rather than a search or category page, and
+//  - have a posting date that can be verified to fall inside the chosen time window.
+// One request makes at most MAX_CALLS provider searches and never loops to "fill up" a result count.
 // Proxies a small set of search terms to Tavily so the API key never reaches the browser.
 
 import { findPostedDate, hostMatches, isTimeWindowId, isWithinWindow, toDateOnly, WINDOW_DAYS } from '../lib/recency.js';
 import type { TimeWindowId } from '../lib/recency.js';
 import { ATS_GROUP, getSource, isSourceId } from '../lib/sources.js';
 import type { SourceDef } from '../lib/sources.js';
+import { listingMatchesAnyPlace, parsePlace } from '../lib/geo.js';
+import { classifyListing, describeListing, listingKey } from '../lib/listings.js';
 
 interface SearchRequest {
   timeWindow?: string;
@@ -16,6 +22,10 @@ interface SearchRequest {
   location?: string;
   locations?: unknown;
   workMode?: string;
+  /** 1 for a new search; 2, 3... for "Search More Jobs" (different queries, already-shown listings skipped). */
+  page?: unknown;
+  /** Keys of listings the browser already shows, so they are not returned again. */
+  seen?: unknown;
 }
 
 interface TavilyResult {
@@ -39,7 +49,13 @@ const NEBIUS_DEFAULT_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
 const PLANNER_TIMEOUT_MS = 15_000;
 
 // One click runs at most MAX_CALLS Tavily searches in total, however many places and sites are selected.
+// "Search More Jobs" requests (page 2 and later) use a smaller budget.
 const MAX_CALLS = 8;
+const MAX_CALLS_MORE = 5;
+const MAX_PAGES = 4;
+// The browser shows 10 at a time. The server returns a ranked pool so further batches need no new provider call.
+const MAX_CANDIDATES = 30;
+const MAX_SEEN = 300;
 const MAX_PLACES = 5;
 const SOURCES_PER_CALL = 4;
 const LOCATION_TOKEN = '{location}';
@@ -70,9 +86,22 @@ function makeQueries(profile: SearchRequest): string[] {
   ];
 }
 
+// Two more phrasings, used only by "Search More Jobs" so that the next batch is not the same search again.
+function extraQueries(profile: SearchRequest): string[] {
+  const roles = cleanField(profile.targetRoles).split(/[\n,;|]/).map((part) => part.trim()).filter(Boolean).slice(0, 2);
+  const mode = cleanField(profile.workMode);
+  const rolePhrase = roles.length ? roles.map((role) => `"${role}"`).join(' OR ') : '"professional"';
+  const modePart = mode && mode !== 'Any' ? mode : '';
+  return [
+    `${rolePhrase} vacancy ${LOCATION_TOKEN} ${modePart} hiring now`.replace(/\s+/g, ' ').trim(),
+    `${rolePhrase} job opening ${LOCATION_TOKEN} ${modePart} apply online`.replace(/\s+/g, ' ').trim(),
+  ];
+}
+
 const PLANNER_PROMPT = `You plan web searches that find CURRENT job vacancies for a candidate.
 Given target roles, skills and work mode, write exactly 3 short search queries (each under 200 characters).
-Write the literal text {location} where the place name belongs; the system replaces it with each place the candidate selected. Never write real place names yourself.
+Write the literal text {location} exactly once in every query, where the place name belongs; the system replaces it with each place the candidate selected. Never write real place names yourself.
+Queries must target ONE specific vacancy page (a single job posting), not job-search or category pages.
 1. a plain query for open positions using the main target title and {location};
 2. a query using realistic alternative or adjacent job titles (synonyms, seniority variants) plus {location};
 3. a query aimed at employer career pages or applicant-tracking sites (Greenhouse, Lever, Workday) combining title, key skills and {location}.
@@ -189,11 +218,12 @@ function parseLocations(profile: SearchRequest): string[] {
   return places;
 }
 
-// "Mumbai, India" -> "Mumbai" India (city quoted, country loose); "India" -> "India".
+// "Navi Mumbai, India" -> "Navi Mumbai" "India" (city and country both quoted); "India" -> "India".
 function locationTerm(label: string): string {
   if (!label) return '';
   const [city, ...rest] = label.split(',');
-  return rest.length ? `"${city.trim()}" ${rest.join(' ').trim()}` : `"${label}"`;
+  const country = rest.join(' ').trim();
+  return country ? `"${city.trim()}" "${country}"` : `"${label}"`;
 }
 
 function fillLocation(query: string, term: string): string {
@@ -203,28 +233,40 @@ function fillLocation(query: string, term: string): string {
 
 /**
  * Plans the Tavily calls. Sources are grouped (about four per call) and each group is searched once per place.
- * The total never exceeds MAX_CALLS: when many places are selected, groups are merged so every place and every
+ * The total never exceeds `cap`: when many places are selected, groups are merged so every place and every
  * ticked site is still covered, just with fewer result slots per site.
+ * Page 1 uses the planned queries; later pages rotate through other phrasings so a repeat click finds new listings.
  */
-function buildJobs(sources: SourceDef[], queries: string[], places: string[]): SearchJob[] {
+function buildJobs(sources: SourceDef[], queries: string[], places: string[], page = 1, extras: string[] = []): SearchJob[] {
+  const cap = page > 1 ? MAX_CALLS_MORE : MAX_CALLS;
   const targets = places.length ? places : [''];
-  const perPlace = Math.max(1, Math.floor(MAX_CALLS / targets.length));
+  const perPlace = Math.max(1, Math.floor(cap / targets.length));
   const ats = sources.filter((source) => source.group === ATS_GROUP);
   const portals = sources.filter((source) => source.group !== ATS_GROUP);
 
+  let portalQuery = queries[0];
+  let atsQuery = queries[2] ?? queries[0];
+  let altQuery = queries[1];
+  if (page > 1) {
+    const pool = [queries[1] ?? queries[0], extras[0] ?? queries[0], extras[1] ?? queries[0], queries[0]];
+    portalQuery = pool[(page - 2) % pool.length];
+    altQuery = pool[(page - 1) % pool.length];
+    atsQuery = page % 2 === 0 ? (queries[2] ?? portalQuery) : (extras[1] ?? portalQuery);
+  }
+
   const groups: { sources: SourceDef[]; query: string }[] = [];
   if (perPlace === 1) {
-    groups.push({ sources, query: queries[0] });
+    groups.push({ sources, query: portalQuery });
   } else {
     const portalCalls = portals.length ? Math.min(perPlace - (ats.length ? 1 : 0), Math.ceil(portals.length / SOURCES_PER_CALL)) : 0;
     const buckets: SourceDef[][] = Array.from({ length: portalCalls }, () => []);
     portals.forEach((source, index) => buckets[index % portalCalls].push(source));
-    buckets.forEach((bucket) => groups.push({ sources: bucket, query: queries[0] }));
-    if (ats.length) groups.push({ sources: ats, query: queries[2] ?? queries[0] });
-    // Spare budget: repeat the portal groups with the second (alternative titles) query.
+    buckets.forEach((bucket) => groups.push({ sources: bucket, query: portalQuery }));
+    if (ats.length) groups.push({ sources: ats, query: atsQuery });
+    // Spare budget: repeat the portal groups with an alternative-titles query.
     for (const bucket of buckets) {
-      if (groups.length >= perPlace || !queries[1]) break;
-      groups.push({ sources: bucket, query: queries[1] });
+      if (groups.length >= perPlace || !altQuery) break;
+      groups.push({ sources: bucket, query: altQuery });
     }
   }
 
@@ -234,12 +276,24 @@ function buildJobs(sources: SourceDef[], queries: string[], places: string[]): S
       jobs.push({
         query: fillLocation(group.query, locationTerm(place)),
         domains: [...new Set(group.sources.flatMap((source) => source.domains))],
-        maxResults: Math.min(20, 8 + 3 * group.sources.length),
+        // Result count does not change the provider's price, and many results are filtered out below.
+        maxResults: Math.min(20, 10 + 3 * group.sources.length),
       });
     }
   }
-  return jobs.slice(0, MAX_CALLS);
+  return jobs.slice(0, cap);
 }
+
+const clampPage = (value: unknown): number => {
+  const page = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 1;
+  return Math.min(MAX_PAGES, Math.max(1, page));
+};
+
+const parseSeen = (value: unknown): Set<string> => new Set(
+  (Array.isArray(value) ? value : [])
+    .filter((item): item is string => typeof item === 'string' && item.length > 0 && item.length <= 300)
+    .slice(0, MAX_SEEN),
+);
 
 export async function POST(request: Request): Promise<Response> {
   const apiKey = process.env.TAVILY_API_KEY;
@@ -282,6 +336,8 @@ export async function POST(request: Request): Promise<Response> {
     workMode: cleanField(profile.workMode),
   };
   const places = parseLocations(profile);
+  const page = clampPage(profile.page);
+  const alreadyShown = parseSeen(profile.seen);
   const ruleQueries = makeQueries(cleanProfile);
   const planned = await planQueries(cleanProfile);
   // Nemotron-planned queries first; any missing slots are filled by the rule-based ones.
@@ -289,7 +345,7 @@ export async function POST(request: Request): Promise<Response> {
   const planner = planned.length > 0 ? 'nemotron' : 'rules';
 
   const now = new Date();
-  const jobs = buildJobs(sources, queries, places);
+  const jobs = buildJobs(sources, queries, places, page, extraQueries(cleanProfile));
   // allSettled so one slow or failing query does not throw away the others.
   const settled = await Promise.allSettled(jobs.map((job) => runSearch(job.query, apiKey, { window, now, domains: job.domains, maxResults: job.maxResults })));
   const fulfilled = settled.filter((entry): entry is PromiseFulfilledResult<TavilyResult[]> => entry.status === 'fulfilled');
@@ -300,20 +356,50 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const allowedDomains = sources.flatMap((source) => source.domains);
-  const excluded = { otherSource: 0, undated: 0, tooOld: 0, invalid: 0 };
-  const seen = new Set<string>();
-  const results = [];
+  const placeSpecs = places.map(parsePlace);
+  const allowRemote = cleanProfile.workMode === 'Remote';
+  const excluded = { otherSource: 0, undated: 0, tooOld: 0, invalid: 0, notVacancy: 0, wrongLocation: 0, alreadyShown: 0, duplicate: 0 };
+  const batchKeys = new Set<string>();
+  const batchTitles = new Set<string>();
+  const candidates: { job: ReturnType<typeof toJob>; rank: number; time: number }[] = [];
+
+  function toJob(result: TavilyResult, posted: { date: Date; source: string }, key: string) {
+    return {
+      title: describeListing(cleanField(result.title), places, result.url).title || 'Untitled job',
+      url: result.url as string,
+      content: cleanField(result.content),
+      score: typeof result.score === 'number' ? result.score : undefined,
+      publishedDate: posted.date.toISOString(),
+      dateSource: posted.source,
+      key,
+    };
+  }
+
   for (const result of fulfilled.flatMap((entry) => entry.value)) {
     if (!result.url) { excluded.invalid += 1; continue; }
     try {
       if (!['http:', 'https:'].includes(new URL(result.url).protocol)) { excluded.invalid += 1; continue; }
     } catch { excluded.invalid += 1; continue; }
-    const key = canonicalKey(result.url);
-    if (seen.has(key)) continue;
-    seen.add(key);
+
+    // The same page returned by several of the searches is counted once.
+    const key = listingKey(result.url);
+    if (batchKeys.has(key)) continue;
+    batchKeys.add(key);
 
     // User-selected portals only.
     if (!hostMatches(result.url, allowedDomains)) { excluded.otherSource += 1; continue; }
+    if (alreadyShown.has(key)) { excluded.alreadyShown += 1; continue; }
+
+    // One specific vacancy, not a search page, a category page or "15,000 vacancies".
+    if (!classifyListing({ url: result.url, title: result.title ?? '' }).ok) { excluded.notVacancy += 1; continue; }
+
+    // The listing must be for one of the selected places (title, link and snippet are checked, not page navigation).
+    if (!listingMatchesAnyPlace(placeSpecs, {
+      title: result.title ?? '',
+      url: result.url,
+      snippet: result.content ?? '',
+      fallback: (result.raw_content ?? '').slice(0, 1200),
+    }, allowRemote)) { excluded.wrongLocation += 1; continue; }
 
     // Strict time window: no verifiable date, or a date outside the window, means the listing is dropped.
     const posted = findPostedDate({
@@ -323,18 +409,22 @@ export async function POST(request: Request): Promise<Response> {
     if (!posted) { excluded.undated += 1; continue; }
     if (!isWithinWindow(posted.date, window, now)) { excluded.tooOld += 1; continue; }
 
-    results.push({
-      title: cleanField(result.title) || 'Untitled job search result',
-      url: result.url,
-      content: cleanField(result.content),
-      score: typeof result.score === 'number' ? result.score : undefined,
-      publishedDate: posted.date.toISOString(),
-      dateSource: posted.source,
-    });
+    // The same job posted on two sites (same role and company) is shown once.
+    const described = describeListing(cleanField(result.title), places, result.url);
+    const titleKey = described.company ? `${described.role}|${described.company}`.toLowerCase() : '';
+    if (titleKey && batchTitles.has(titleKey)) { excluded.duplicate += 1; continue; }
+    if (titleKey) batchTitles.add(titleKey);
+
+    candidates.push({ job: toJob(result, posted, key), rank: typeof result.score === 'number' ? result.score : 0, time: posted.date.getTime() });
   }
 
+  // Best provider relevance first, newest first among equals. The browser re-ranks by profile match.
+  candidates.sort((a, b) => b.rank - a.rank || b.time - a.time);
+  const results = candidates.slice(0, MAX_CANDIDATES).map((entry) => entry.job);
+  const overflow = Math.max(0, candidates.length - MAX_CANDIDATES);
+
   const queriesSent = [...new Set(jobs.map((job) => job.query))];
-  return json({ results, queriesRun: fulfilled.length, queries: queriesSent, planner, timeWindow: window, sources: sourceIds, locations: places, excluded }, 200, { 'Cache-Control': 'no-store' });
+  return json({ results, queriesRun: fulfilled.length, queries: queriesSent, planner, timeWindow: window, sources: sourceIds, locations: places, page, overflow, excluded }, 200, { 'Cache-Control': 'no-store' });
 }
 
 export function GET(): Response {

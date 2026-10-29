@@ -7,11 +7,13 @@ import {
 } from 'lucide-react';
 import { buildSearchFallbackLinks, canonicalizeUrl, domainOf, makeJobId, rankJobs, suggestProfileFromResume } from './lib/matcher';
 import { DEFAULT_PROFILE, STATUS_OPTIONS } from './lib/types';
-import type { AiAnalysis, ApplicationStatus, CareerProfile, JobResult, JobSearchResponse, RawJobResult, WorkMode } from './lib/types';
+import type { AiAnalysis, ApplicationStatus, CareerProfile, JobResult, JobSearchResponse, RawJobResult, SearchExclusions, WorkMode } from './lib/types';
 import { CvError, extractCvText } from './lib/cv';
 import { DEFAULT_SOURCES, DEFAULT_TIME_WINDOW, isPostedWithin, isSourceId, isTimeWindowId, TIME_WINDOWS, windowLabel } from './lib/window';
 import type { TimeWindowId } from './lib/window';
 import { cleanCustomLocation, MAX_LOCATIONS, splitLegacyLocation } from './lib/locations';
+import { isIndividualVacancy } from '../lib/listings';
+import { canSearchMore as canOfferMore, describeExclusions, MAX_BATCHES, PAGE_SIZE, plural, revealNext, visibleAfterFetch, windowAge } from './lib/paging';
 import { LocationPicker } from './components/LocationPicker';
 import { SourcePicker } from './components/SourcePicker';
 import './styles.css';
@@ -110,6 +112,10 @@ function App() {
   const [profile, setProfile] = useState<CareerProfile>(() => sanitizeProfile(readLocal(PROFILE_KEY, DEFAULT_PROFILE)));
   const [savedJobs, setSavedJobs] = useState<JobResult[]>(readJobs);
   const [results, setResults] = useState<JobResult[]>([]);
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [batch, setBatch] = useState(1);
+  const [noMore, setNoMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [tab, setTab] = useState<Tab>('radar');
   const [filter, setFilter] = useState<FilterKey>('all');
   const [loading, setLoading] = useState(false);
@@ -140,13 +146,16 @@ function App() {
   }, [savedJobs]);
 
   const fallbackLinks = useMemo(() => buildSearchFallbackLinks({ ...profile, location: profile.locations[0] ?? '' }), [profile]);
+  // Only the first `visibleCount` of the ranked pool is shown; the rest stays hidden until "Search More Jobs".
+  const shownResults = useMemo(() => results.slice(0, visibleCount), [results, visibleCount]);
   const visibleResults = useMemo(() => {
-    if (filter === 'strong') return results.filter((job) => job.matchScore >= 70);
-    if (filter === 'medium') return results.filter((job) => job.matchScore >= 40 && job.matchScore < 70);
-    return results;
-  }, [filter, results]);
+    if (filter === 'strong') return shownResults.filter((job) => job.matchScore >= 70);
+    if (filter === 'medium') return shownResults.filter((job) => job.matchScore >= 40 && job.matchScore < 70);
+    return shownResults;
+  }, [filter, shownResults]);
+  const canSearchMore = canOfferMore({ total: results.length, visible: visibleCount, batch, exhausted: noMore });
   const savedUrlSet = useMemo(() => new Set(savedJobs.map((job) => job.url)), [savedJobs]);
-  const strongCount = results.filter((job) => job.matchScore >= 70).length;
+  const strongCount = shownResults.filter((job) => job.matchScore >= 70).length;
 
   function updateProfile<K extends keyof CareerProfile>(key: K, value: CareerProfile[K]) {
     setProfile((current) => ({ ...current, [key]: value }));
@@ -262,18 +271,24 @@ function App() {
       });
       const payload = await response.json().catch(() => null) as (JobSearchResponse & { error?: string }) | null;
       if (!response.ok || !payload) throw new Error(payload?.error || 'Search service is not available. Use the direct-search links or add a job URL manually.');
-      // Defence in depth: the server already filters, but nothing outside the window is ever displayed.
-      const inWindow = (Array.isArray(payload.results) ? payload.results : []).filter((job) => isPostedWithin(job.publishedDate, windowId));
+      // Defence in depth: the server already filters, but nothing outside the window, and no search or category page,
+      // is ever displayed.
+      const inWindow = (Array.isArray(payload.results) ? payload.results : [])
+        .filter((job) => isPostedWithin(job.publishedDate, windowId) && isIndividualVacancy(job));
       const ranked = rankJobs(inWindow, profile);
       setResults(ranked);
+      setVisibleCount(PAGE_SIZE);
+      setBatch(1);
+      setNoMore(false);
       setLastQueries(Array.isArray(payload.queries) && payload.queries.length ? { queries: payload.queries, planner: payload.planner === 'nemotron' ? 'nemotron' : 'rules' } : null);
-      const hidden = payload.excluded;
-      const hiddenNote = hidden && (hidden.undated || hidden.tooOld)
-        ? ` Hidden: ${hidden.undated} without a verifiable posting date, ${hidden.tooOld} older than ${windowLabel(windowId).replace('last ', '')}.`
-        : '';
+      const windowText = windowLabel(windowId);
+      const shown = Math.min(ranked.length, PAGE_SIZE);
+      const left = describeExclusions(payload.excluded, windowAge(windowId));
+      const queryCount = payload.queriesRun ?? 1;
+      const searched = `Searched ${plural(queryCount, 'targeted query', 'targeted queries')}${payload.planner === 'nemotron' ? ' planned by NVIDIA Nemotron' : ''}.`;
       setSearchNote(ranked.length
-        ? `Showing listings posted within the ${windowLabel(windowId).replace('last ', 'last ')}. Searched ${payload.queriesRun ?? 1} targeted ${(payload.queriesRun ?? 1) === 1 ? 'query' : 'queries'}${payload.planner === 'nemotron' ? ' planned by NVIDIA Nemotron' : ''}. Results are ranked using visible listing text and your selected skills.${hiddenNote}`
-        : `No listings with a verifiable posting date in the ${windowLabel(windowId)} were found on the selected sources.${hiddenNote} Try a longer window, more sources or broader titles.`);
+        ? `Showing ${shown}${ranked.length > shown ? ` of ${ranked.length}` : ''} individual job ${shown === 1 ? 'listing' : 'listings'} posted within the ${windowText}${ranked.length < PAGE_SIZE ? `. Fewer than ${PAGE_SIZE} passed our checks` : ''}. ${searched}${left}`
+        : `No individual job listings for your places, sources and the ${windowText} passed our checks. ${searched}${left} Try a longer window, more sources or places, or broader titles.`);
       setTab('radar');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to search right now.';
@@ -283,6 +298,58 @@ function App() {
       setSearchNote('You can still search directly on public job-search pages or add a posting URL manually.');
     } finally {
       setLoading(false);
+    }
+  }
+
+  /** Reveals the next 10 listings already found, or runs one more bounded search when none are left. */
+  async function searchMore() {
+    if (loading || loadingMore) return;
+    if (results.length > visibleCount) {
+      const next = revealNext(results.length, visibleCount);
+      setVisibleCount(next);
+      setSearchNote(`Showing ${next} of ${results.length} individual job listings found so far.`);
+      return;
+    }
+    if (noMore || batch >= MAX_BATCHES || results.length === 0) return;
+    const windowId: TimeWindowId = profile.timeWindow;
+    const windowText = windowLabel(windowId);
+    setLoadingMore(true);
+    setSearchError('');
+    try {
+      const response = await fetch('/api/search-jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetRoles: profile.targetRoles,
+          skills: profile.skills,
+          location: profile.locations.join('; '),
+          locations: profile.locations,
+          workMode: profile.workMode,
+          timeWindow: windowId,
+          sources: profile.sources,
+          page: batch + 1,
+          seen: results.map((job) => job.key).filter((key): key is string => Boolean(key)).slice(0, 300),
+        }),
+      });
+      const payload = await response.json().catch(() => null) as (JobSearchResponse & { error?: string }) | null;
+      if (!response.ok || !payload) throw new Error(payload?.error || 'Search service is not available right now.');
+      const known = new Set(results.flatMap((job) => [job.url, job.key].filter(Boolean) as string[]));
+      const inWindow = (Array.isArray(payload.results) ? payload.results : [])
+        .filter((job) => isPostedWithin(job.publishedDate, windowId) && isIndividualVacancy(job) && !known.has(job.key ?? '') && !known.has(canonicalizeUrl(job.url)));
+      const fresh = rankJobs(inWindow, profile);
+      setBatch(batch + 1);
+      if (fresh.length === 0) {
+        setNoMore(true);
+        setSearchNote(`No more new individual listings were found for your places and sources in the ${windowText}.${describeExclusions(payload.excluded, windowAge(windowId))} Try a longer window or more sources.`);
+      } else {
+        setResults([...results, ...fresh]);
+        setVisibleCount(visibleAfterFetch(results.length, fresh.length));
+        setSearchNote(`Added ${plural(Math.min(fresh.length, PAGE_SIZE), 'new listing')} from a different search.${describeExclusions(payload.excluded, windowAge(windowId))}`);
+      }
+    } catch (error) {
+      setSearchError(error instanceof Error ? error.message : 'Unable to search for more jobs right now.');
+    } finally {
+      setLoadingMore(false);
     }
   }
 
@@ -423,7 +490,7 @@ function App() {
         </section>
 
         <section className="metrics-row" aria-label="Your job search overview">
-          <div className="metric-card"><div className="metric-icon blue"><Search size={18} /></div><div><span>Results found</span><strong>{results.length}</strong><small>Latest search</small></div></div>
+          <div className="metric-card"><div className="metric-icon blue"><Search size={18} /></div><div><span>Results shown</span><strong>{shownResults.length}</strong><small>Latest search</small></div></div>
           <div className="metric-card"><div className="metric-icon green"><Target size={18} /></div><div><span>Strong matches</span><strong>{strongCount}</strong><small>70%+ preliminary fit</small></div></div>
           <div className="metric-card"><div className="metric-icon purple"><Bookmark size={18} /></div><div><span>Saved opportunities</span><strong>{savedJobs.length}</strong><small>Tracked on this device</small></div></div>
           <div className="metric-card"><div className="metric-icon amber"><TrendingUp size={18} /></div><div><span>In progress</span><strong>{savedJobs.filter((job) => ['Applied', 'Interview', 'Offer'].includes(job.status)).length}</strong><small>Applied, interview or offer</small></div></div>
@@ -479,7 +546,7 @@ function App() {
 
           <section className="results-column">
             <div className="results-header">
-              <div className="results-tabs"><button className={tab === 'radar' ? 'results-tab active' : 'results-tab'} onClick={() => setTab('radar')}>Job radar <span>{results.length}</span></button><button className={tab === 'saved' ? 'results-tab active' : 'results-tab'} onClick={() => setTab('saved')}>Saved jobs <span>{savedJobs.length}</span></button></div>
+              <div className="results-tabs"><button className={tab === 'radar' ? 'results-tab active' : 'results-tab'} onClick={() => setTab('radar')}>Job radar <span>{shownResults.length}</span></button><button className={tab === 'saved' ? 'results-tab active' : 'results-tab'} onClick={() => setTab('saved')}>Saved jobs <span>{savedJobs.length}</span></button></div>
               <button className="secondary-button" onClick={() => setShowManualForm(true)}><ExternalLink size={15} /> Add URL</button>
             </div>
 
@@ -487,11 +554,11 @@ function App() {
             {searchNote && !searchError && <div className="alert info-alert"><CheckCircle2 size={17} /><span>{searchNote}</span></div>}
 
             {tab === 'radar' ? <>
-              <div className="list-intro"><div><h2>{results.length ? 'Recommended for you' : 'Ready when you are'}</h2><p>{results.length ? (queryLabel ? `Search · ${queryLabel}` : 'Ranked by visible job details and your skills') : 'Run a job search to discover roles from across the public web.'}</p></div>{results.length > 0 && <button className="refresh-button" onClick={runSearch} disabled={loading}><RefreshCw size={15} className={loading ? 'spin' : ''} /> Refresh</button>}</div>
+              <div className="list-intro"><div><h2>{shownResults.length ? 'Recommended for you' : 'Ready when you are'}</h2><p>{results.length ? (queryLabel ? `Search · ${queryLabel}` : 'Ranked by visible job details and your skills') : 'Run a job search to discover roles from across the public web.'}</p></div>{results.length > 0 && <button className="refresh-button" onClick={runSearch} disabled={loading}><RefreshCw size={15} className={loading ? 'spin' : ''} /> Refresh</button>}</div>
 
               {lastQueries && results.length > 0 && <details className="query-list"><summary>{lastQueries.planner === 'nemotron' ? 'Searches planned by NVIDIA Nemotron' : 'Searches used (rule-based)'}</summary><ul>{lastQueries.queries.map((query) => <li key={query}>{query}</li>)}</ul></details>}
 
-              {results.length > 0 && <div className="filter-row"><div className="filter-label"><Filter size={15} /> Match filter</div><div className="filter-pills"><button className={filter === 'all' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('all')}>All <span>{results.length}</span></button><button className={filter === 'strong' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('strong')}>Strong <span>{results.filter((job) => job.matchScore >= 70).length}</span></button><button className={filter === 'medium' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('medium')}>Possible <span>{results.filter((job) => job.matchScore >= 40 && job.matchScore < 70).length}</span></button></div></div>}
+              {results.length > 0 && <div className="filter-row"><div className="filter-label"><Filter size={15} /> Match filter</div><div className="filter-pills"><button className={filter === 'all' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('all')}>All <span>{shownResults.length}</span></button><button className={filter === 'strong' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('strong')}>Strong <span>{shownResults.filter((job) => job.matchScore >= 70).length}</span></button><button className={filter === 'medium' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('medium')}>Possible <span>{shownResults.filter((job) => job.matchScore >= 40 && job.matchScore < 70).length}</span></button></div></div>}
 
               {loading && <div className="loading-state"><span className="loader" /><strong>Searching public job listings</strong><p>Checking several targeted searches and comparing the results.</p></div>}
 
@@ -501,6 +568,8 @@ function App() {
 
               {!loading && results.length > 0 && visibleResults.length === 0 && <div className="small-empty"><Filter size={20} /><strong>No results in this range</strong><span>Choose another filter to see more listings.</span></div>}
               {!loading && visibleResults.map((job) => <JobCard key={job.id} job={job} saved={savedUrlSet.has(job.url)} onSave={() => saveJob(job)} onAnalyze={analyzeJob} canAnalyze={Boolean(profile.targetRoles.trim())} />)}
+
+              {!loading && results.length > 0 && (canSearchMore || loadingMore) && <div className="more-row"><button className="secondary-button more-button" onClick={() => void searchMore()} disabled={loadingMore} aria-busy={loadingMore}>{loadingMore && <RefreshCw size={15} className="spin" />}Search More Jobs</button></div>}
 
               {!loading && results.length > 0 && <div className="results-footnote"><ShieldCheck size={16} /><span>Preliminary matches are based on available search-result text, not a complete evaluation of every job description. Open the original listing to verify requirements, posting status and application details.</span></div>}
               {!loading && results.length === 0 && <div className="direct-search-note"><span className="direct-search-dot" /><span>If web search is unavailable or finds too few results, use a direct search link or broaden your query.</span></div>}
