@@ -32,5 +32,11 @@ export function describeExclusions(ex: Partial<SearchExclusions> | undefined, wi
   return parts.length ? ` Left out: ${parts.join(', ')}.` : '';
 }
 
+/** Says so when some of the provider searches failed, because the results are then incomplete. */
+export function describeFailures(failed: number | undefined, total: number): string {
+  if (!failed || failed <= 0) return '';
+  return ` ${failed} of ${total} searches failed, so these results may be incomplete. Search again in a minute.`;
+}
+
 /** "last 1 week" -> "1 week"; "last 1 day (24h)" -> "1 day". Used in "older than 1 week". */
 export const windowAge = (windowId: string): string => ({ '1d': '1 day', '1w': '1 week', '2w': '2 weeks', '3w': '3 weeks', '4w': '4 weeks' } as Record<string, string>)[windowId] ?? windowId;

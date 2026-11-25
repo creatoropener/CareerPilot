@@ -50,6 +50,10 @@ export interface AiAnalysis {
 export interface JobSearchResponse {
   results: RawJobResult[];
   queriesRun: number;
+  /** Provider searches that failed. The results are then incomplete. */
+  queriesFailed?: number;
+  /** True when the answer came from the server's short-lived cache. */
+  cached?: boolean;
   queries?: string[];
   planner?: 'nemotron' | 'rules';
   page?: number;

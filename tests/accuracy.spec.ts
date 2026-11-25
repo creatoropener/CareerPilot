@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { POST } from '../api/search-jobs';
+import { POST, resetSearchGuards } from '../api/search-jobs';
 
 const request = (payload: unknown) => new Request('http://x/api/search-jobs', { method: 'POST', body: JSON.stringify(payload) });
 const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
@@ -25,7 +25,7 @@ const dubai = { title: 'Import Manager - Delta Trading - Dubai - Bayt.com', url:
 const bulk = { title: '15,000 Import Manager Jobs in Navi Mumbai - Naukri.com', url: 'https://www.naukri.com/import-manager-jobs-in-navi-mumbai', content: 'Navi Mumbai. Apply to 15,000 vacancies', published_date: daysAgo(1) };
 
 describe('location accuracy', () => {
-  beforeEach(() => { process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
+  beforeEach(() => { resetSearchGuards(); process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
   afterEach(() => { vi.restoreAllMocks(); delete process.env.TAVILY_API_KEY; });
 
   it('keeps only listings for the selected places', async () => {
@@ -56,7 +56,7 @@ describe('location accuracy', () => {
 });
 
 describe('individual vacancies only', () => {
-  beforeEach(() => { process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
+  beforeEach(() => { resetSearchGuards(); process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
   afterEach(() => { vi.restoreAllMocks(); delete process.env.TAVILY_API_KEY; });
 
   it('drops bulk and search pages and shows Role — Company', async () => {
@@ -75,7 +75,7 @@ describe('individual vacancies only', () => {
 });
 
 describe('batches and cost', () => {
-  beforeEach(() => { process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
+  beforeEach(() => { resetSearchGuards(); process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
   afterEach(() => { vi.restoreAllMocks(); delete process.env.TAVILY_API_KEY; });
 
   const many = (count: number) => Array.from({ length: count }, (_, index) => ({

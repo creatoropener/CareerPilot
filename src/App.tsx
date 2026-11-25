@@ -13,7 +13,8 @@ import { DEFAULT_SOURCES, DEFAULT_TIME_WINDOW, isPostedWithin, isSourceId, isTim
 import type { TimeWindowId } from './lib/window';
 import { cleanCustomLocation, MAX_LOCATIONS, splitLegacyLocation } from './lib/locations';
 import { isIndividualVacancy } from '../lib/listings';
-import { canSearchMore as canOfferMore, describeExclusions, MAX_BATCHES, PAGE_SIZE, plural, revealNext, visibleAfterFetch, windowAge } from './lib/paging';
+import { canSearchMore as canOfferMore, describeExclusions, describeFailures, MAX_BATCHES, PAGE_SIZE, plural, revealNext, visibleAfterFetch, windowAge } from './lib/paging';
+import { ageLabel, isNarrowScreen, scrollToElement } from './lib/format';
 import { LocationPicker } from './components/LocationPicker';
 import { SourcePicker } from './components/SourcePicker';
 import './styles.css';
@@ -134,6 +135,7 @@ function App() {
   const [lastQueries, setLastQueries] = useState<{ queries: string[]; planner: 'nemotron' | 'rules' } | null>(null);
   const importInput = useRef<HTMLInputElement>(null);
   const cvInput = useRef<HTMLInputElement>(null);
+  const resultsRef = useRef<HTMLElement>(null);
   const [cvName, setCvName] = useState('');
   const [cvLoading, setCvLoading] = useState(false);
 
@@ -285,11 +287,17 @@ function App() {
       const shown = Math.min(ranked.length, PAGE_SIZE);
       const left = describeExclusions(payload.excluded, windowAge(windowId));
       const queryCount = payload.queriesRun ?? 1;
+      const failed = describeFailures(payload.queriesFailed, queryCount + (payload.queriesFailed ?? 0));
       const searched = `Searched ${plural(queryCount, 'targeted query', 'targeted queries')}${payload.planner === 'nemotron' ? ' planned by NVIDIA Nemotron' : ''}.`;
       setSearchNote(ranked.length
-        ? `Showing ${shown}${ranked.length > shown ? ` of ${ranked.length}` : ''} individual job ${shown === 1 ? 'listing' : 'listings'} posted within the ${windowText}${ranked.length < PAGE_SIZE ? `. Fewer than ${PAGE_SIZE} passed our checks` : ''}. ${searched}${left}`
-        : `No individual job listings for your places, sources and the ${windowText} passed our checks. ${searched}${left} Try a longer window, more sources or places, or broader titles.`);
+        ? `Showing ${shown}${ranked.length > shown ? ` of ${ranked.length}` : ''} individual job ${shown === 1 ? 'listing' : 'listings'} posted within the ${windowText}${ranked.length < PAGE_SIZE ? `. Fewer than ${PAGE_SIZE} passed our checks` : ''}. ${searched}${left}${failed}`
+        : `No individual job listings for your places, sources and the ${windowText} passed our checks. ${searched}${left}${failed} Try a longer window, more sources or places, or broader titles.`);
       setTab('radar');
+      // On a phone the long profile form would sit above the results, so fold it away once there are some.
+      if (ranked.length > 0 && isNarrowScreen()) {
+        setShowProfileForm(false);
+        window.setTimeout(() => scrollToElement(resultsRef.current), 60); // after the form has folded away
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to search right now.';
       setSearchError(message);
@@ -344,7 +352,7 @@ function App() {
       } else {
         setResults([...results, ...fresh]);
         setVisibleCount(visibleAfterFetch(results.length, fresh.length));
-        setSearchNote(`Added ${plural(Math.min(fresh.length, PAGE_SIZE), 'new listing')} from a different search.${describeExclusions(payload.excluded, windowAge(windowId))}`);
+        setSearchNote(`Added ${plural(Math.min(fresh.length, PAGE_SIZE), 'new listing')} from a different search.${describeExclusions(payload.excluded, windowAge(windowId))}${describeFailures(payload.queriesFailed, (payload.queriesRun ?? 0) + (payload.queriesFailed ?? 0))}`);
       }
     } catch (error) {
       setSearchError(error instanceof Error ? error.message : 'Unable to search for more jobs right now.');
@@ -544,7 +552,7 @@ function App() {
             <section className="tips-card"><div className="tips-icon"><CircleHelp size={18} /></div><div><strong>Get better matches</strong><p>Use 3–8 specific skills and more than one realistic target title. Broad profiles usually return noisier results.</p></div></section>
           </aside>
 
-          <section className="results-column">
+          <section className="results-column" ref={resultsRef}>
             <div className="results-header">
               <div className="results-tabs"><button className={tab === 'radar' ? 'results-tab active' : 'results-tab'} onClick={() => setTab('radar')}>Job radar <span>{shownResults.length}</span></button><button className={tab === 'saved' ? 'results-tab active' : 'results-tab'} onClick={() => setTab('saved')}>Saved jobs <span>{savedJobs.length}</span></button></div>
               <button className="secondary-button" onClick={() => setShowManualForm(true)}><ExternalLink size={15} /> Add URL</button>
@@ -560,7 +568,8 @@ function App() {
 
               {results.length > 0 && <div className="filter-row"><div className="filter-label"><Filter size={15} /> Match filter</div><div className="filter-pills"><button className={filter === 'all' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('all')}>All <span>{shownResults.length}</span></button><button className={filter === 'strong' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('strong')}>Strong <span>{shownResults.filter((job) => job.matchScore >= 70).length}</span></button><button className={filter === 'medium' ? 'filter-pill selected' : 'filter-pill'} onClick={() => setFilter('medium')}>Possible <span>{shownResults.filter((job) => job.matchScore >= 40 && job.matchScore < 70).length}</span></button></div></div>}
 
-              {loading && <div className="loading-state"><span className="loader" /><strong>Searching public job listings</strong><p>Checking several targeted searches and comparing the results.</p></div>}
+              {loading && <div className="loading-state" role="status" aria-live="polite"><span className="loader" /><strong>Searching public job listings</strong><p>Checking several targeted searches and comparing the results.</p></div>}
+              {loading && <div className="skeleton-list" aria-hidden="true">{[0, 1, 2].map((index) => <div className="skeleton-card" key={index}><span className="skeleton-line wide" /><span className="skeleton-line" /><span className="skeleton-line short" /></div>)}</div>}
 
               {!loading && results.length === 0 && <div className="empty-state"><div className="empty-art"><div className="empty-orbit orbit-one" /><div className="empty-orbit orbit-two" /><div className="empty-icon"><Search size={29} /></div><span className="sparkle sparkle-one">✦</span><span className="sparkle sparkle-two">✧</span></div><h3>Make your next move</h3><p>Add a target role and preferred location, then search. CareerPilot will gather public results, rank them, and show the original URLs where available.</p><button className="primary-button" onClick={() => { setShowProfileForm(true); void runSearch(); }} disabled={!profile.targetRoles.trim()}><Search size={17} /> Search for jobs</button>
                   <div className="divider-or"><span>or search directly</span></div><div className="fallback-links">{fallbackLinks.map((link) => <a key={link.label} href={link.url} target="_blank" rel="noreferrer"><Globe2 size={15} /> {link.label} <ExternalLink size={13} /></a>)}</div>
@@ -627,10 +636,15 @@ function JobCard({ job, saved, onSave, statusControl = false, onStatusChange, on
   const scoreTone = job.matchScore >= 70 ? 'strong' : job.matchScore >= 40 ? 'possible' : 'low';
   const resultHint = /\b(job|jobs|career|careers|apply|application|vacancy|vacancies|hiring|position|opening|recruitment)\b/i.test(`${job.title} ${job.content} ${job.url}`);
   return <article className="job-card">
-    <div className="job-card-top"><div className="company-symbol">{job.domain.slice(0, 1).toUpperCase()}</div><div className="job-main"><div className="job-kicker"><span>{job.domain}</span>{niceDate(job.publishedDate) && <><span className="dot-sep">·</span><span>{niceDate(job.publishedDate)}</span></>}</div><h3>{job.title}</h3><div className="job-meta"><span><Globe2 size={13} /> Public web result</span><span className="job-type"><BriefcaseBusiness size={13} /> {resultHint ? 'Potential listing' : 'Related result'}</span></div></div><div className={`match-badge ${scoreTone}`}><strong>{job.matchScore}%</strong><span>match</span></div></div>
+    <div className="job-card-top"><div className="company-symbol">{job.domain.slice(0, 1).toUpperCase()}</div><div className="job-main"><div className="job-kicker"><span>{job.domain}</span>{ageLabel(job.publishedDate) && <><span className="dot-sep">·</span><span className="age-chip" title={niceDate(job.publishedDate) ?? undefined}>{ageLabel(job.publishedDate)}</span></>}</div><h3>{job.title}</h3><div className="job-meta"><span><Globe2 size={13} /> Public web result</span><span className="job-type"><BriefcaseBusiness size={13} /> {resultHint ? 'Potential listing' : 'Related result'}</span></div></div><div className={`match-badge ${scoreTone}`}><strong>{job.matchScore}%</strong><span>match</span></div></div>
     <p className="job-snippet">{job.content || 'The search result did not provide a detailed snippet. Open the original page to verify the role.'}</p>
-    <div className="evidence-line">{job.matchedTerms.length ? <><CheckCircle2 size={14} /><span>Found: {job.matchedTerms.slice(0, 5).join(', ')}</span></> : <><CircleHelp size={14} /><span>Limited matching evidence in the visible result</span></>}</div>
-    {job.missingTerms.length > 0 && <div className="gap-line"><span>Not visible in snippet:</span> {job.missingTerms.slice(0, 4).join(', ')}{job.missingTerms.length > 4 ? '…' : ''}</div>}
+    {job.matchedTerms.length > 0 || job.missingTerms.length > 0
+      ? <div className="chips" aria-label="How this listing matches your profile">
+        {job.matchedTerms.slice(0, 5).map((term) => <span className="chip chip-match" key={`m-${term}`}><CheckCircle2 size={12} aria-hidden="true" /><span className="sr-only">Found: </span>{term}</span>)}
+        {job.missingTerms.slice(0, 4).map((term) => <span className="chip chip-gap" key={`g-${term}`}><span className="sr-only">Not visible in snippet: </span>{term}</span>)}
+        {job.missingTerms.length > 4 && <span className="chip chip-gap" aria-label={`${job.missingTerms.length - 4} more skills not visible`}>+{job.missingTerms.length - 4}</span>}
+      </div>
+      : <div className="evidence-line"><CircleHelp size={14} /><span>Limited matching evidence in the visible result</span></div>}
     {(analysis || analysisError) && <div className="ai-panel">{analysisError ? <div className="ai-error"><X size={14} /><span>{analysisError}</span></div> : analysis && <>
       <div className="ai-head"><Sparkles size={14} /><strong>AI explanation</strong><span className={`ai-verdict ${analysis.verdict}`}>{analysis.verdict}</span></div>
       <p>{analysis.summary}</p>

@@ -13,6 +13,7 @@ import { ATS_GROUP, getSource, isSourceId } from '../lib/sources.js';
 import type { SourceDef } from '../lib/sources.js';
 import { listingMatchesAnyPlace, parsePlace } from '../lib/geo.js';
 import { classifyListing, describeListing, listingKey } from '../lib/listings.js';
+import { clientIp, createRateLimiter, createTtlCache, envNumber } from '../lib/guards.js';
 
 interface SearchRequest {
   timeWindow?: string;
@@ -61,6 +62,25 @@ const SOURCES_PER_CALL = 4;
 const LOCATION_TOKEN = '{location}';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+// Every new search costs up to MAX_CALLS provider searches plus one model call, so searches are limited per client and
+// identical searches are answered from a short-lived cache instead of buying the same results again.
+// SEARCH_RATE_LIMIT_PER_MINUTE (default 6) and SEARCH_CACHE_TTL_SECONDS (default 600, 0 turns the cache off) override these.
+const searchLimiter = createRateLimiter(envNumber('SEARCH_RATE_LIMIT_PER_MINUTE', 6), 60_000);
+const searchCache = createTtlCache<Record<string, unknown>>(envNumber('SEARCH_CACHE_TTL_SECONDS', 600, true) * 1000, 50);
+
+/** Clears the limiter and the cache. Used by the tests. */
+export function resetSearchGuards(): void {
+  searchLimiter.reset();
+  searchCache.clear();
+}
+
+/** The search provider answered with an error status. `status` lets the caller tell "slow down" from "broken". */
+class ProviderError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
 
 const json = (body: unknown, status = 200, extra: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(body), { status, headers: { ...JSON_HEADERS, ...extra } });
@@ -185,7 +205,7 @@ async function runSearch(query: string, apiKey: string, options: SearchOptions):
   });
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
-    throw new Error(`Search provider returned ${response.status}${detail ? `: ${detail.slice(0, 180)}` : ''}`);
+    throw new ProviderError(response.status, `Search provider returned ${response.status}${detail ? `: ${detail.slice(0, 180)}` : ''}`);
   }
   const data = await response.json() as TavilyResponse;
   return Array.isArray(data.results) ? data.results : [];
@@ -338,6 +358,21 @@ export async function POST(request: Request): Promise<Response> {
   const places = parseLocations(profile);
   const page = clampPage(profile.page);
   const alreadyShown = parseSeen(profile.seen);
+
+  // The same search again (Refresh, a double click, two people with the same profile) is answered from the cache.
+  const cacheKey = JSON.stringify([window, [...sourceIds].sort(), targetRoles, cleanProfile.skills, cleanProfile.workMode, places, page, [...alreadyShown].sort()]);
+  const cached = searchCache.get(cacheKey);
+  if (cached) return json({ ...cached, cached: true }, 200, { 'Cache-Control': 'no-store', 'X-Cache': 'HIT' });
+
+  // Only searches that would reach the provider count against the limit. Without a client address (local development) there is nothing to count.
+  const ip = clientIp(request);
+  if (ip) {
+    const limit = searchLimiter.hit(ip);
+    if (limit.limited) {
+      return json({ error: `Too many searches in a short time. Wait ${limit.retryAfterSeconds} seconds and try again.` }, 429, { 'Retry-After': String(limit.retryAfterSeconds) });
+    }
+  }
+
   const ruleQueries = makeQueries(cleanProfile);
   const planned = await planQueries(cleanProfile);
   // Nemotron-planned queries first; any missing slots are filled by the rule-based ones.
@@ -349,8 +384,14 @@ export async function POST(request: Request): Promise<Response> {
   // allSettled so one slow or failing query does not throw away the others.
   const settled = await Promise.allSettled(jobs.map((job) => runSearch(job.query, apiKey, { window, now, domains: job.domains, maxResults: job.maxResults })));
   const fulfilled = settled.filter((entry): entry is PromiseFulfilledResult<TavilyResult[]> => entry.status === 'fulfilled');
+  const failedQueries = settled.length - fulfilled.length;
   if (fulfilled.length === 0) {
-    const first = settled.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
+    const rejected = settled.filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
+    // The provider is rate-limiting us: tell the user to wait rather than reporting a broken service.
+    if (rejected.some((entry) => entry.reason instanceof ProviderError && entry.reason.status === 429)) {
+      return json({ error: 'The job search provider is busy right now. Wait a minute and try again.' }, 429, { 'Retry-After': '60' });
+    }
+    const first = rejected[0];
     const message = first?.reason instanceof Error ? first.reason.message : 'Unknown search error';
     return json({ error: `Job search failed. ${message}` }, 502);
   }
@@ -424,7 +465,10 @@ export async function POST(request: Request): Promise<Response> {
   const overflow = Math.max(0, candidates.length - MAX_CANDIDATES);
 
   const queriesSent = [...new Set(jobs.map((job) => job.query))];
-  return json({ results, queriesRun: fulfilled.length, queries: queriesSent, planner, timeWindow: window, sources: sourceIds, locations: places, page, overflow, excluded }, 200, { 'Cache-Control': 'no-store' });
+  const body = { results, queriesRun: fulfilled.length, queriesFailed: failedQueries, queries: queriesSent, planner, timeWindow: window, sources: sourceIds, locations: places, page, overflow, excluded };
+  // A search where some provider calls failed is incomplete, so it is not cached: trying again should try again.
+  if (failedQueries === 0) searchCache.set(cacheKey, body);
+  return json(body, 200, { 'Cache-Control': 'no-store' });
 }
 
 export function GET(): Response {
