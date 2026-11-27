@@ -397,7 +397,7 @@ p.picker-note { margin: 0; }
 
 /* Touch targets of at least 44px on phones */
 @media (max-width: 620px) {
-  .apply-button, .save-button, .status-select, .ai-button, .details-button, .filter-pill, .refresh-button { min-height: 44px; }
+  .apply-button, .save-button, .status-select, .ai-button, .letter-button, .details-button, .filter-pill, .refresh-button { min-height: 44px; }
   .apply-button, .save-button { font-size: 12px; }
   .metric-card small { display: none; }
 }
@@ -474,4 +474,24 @@ p.picker-note { margin: 0; }
 .follow-button:disabled { color: #1f6f4a; opacity: 1; cursor: default; }
 @media (max-width: 620px) {
   .saved-search-actions .secondary-button { flex: 1; justify-content: center; }
+}
+
+/* ---- cover letter dialog ---- */
+.letter-modal { width: min(720px, 100%); }
+.letter-options { display: grid; grid-template-columns: 1fr 1fr; gap: 0 13px; }
+.letter-wide { grid-column: 1 / -1; }
+.letter-optin { margin: 0 0 12px; }
+.letter-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-bottom: 8px; }
+.letter-privacy { display: block; margin-bottom: 12px; }
+.letter-alert { margin: 0 0 12px; }
+.letter-field textarea { min-height: 260px; resize: vertical; line-height: 1.7; font-size: 13.5px; }
+.letter-warning { display: flex; gap: 9px; align-items: flex-start; background: #fff7e6; border: 1px solid #f5d9a0; color: #7a4b00; border-radius: 10px; padding: 9px 12px; margin: 0 0 10px; font-size: 12.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.letter-warning svg { flex-shrink: 0; margin-top: 2px; }
+.letter-footer { flex-wrap: wrap; align-items: center; }
+.letter-saved { margin-right: auto; display: inline-flex; align-items: center; gap: 5px; color: #1f6f4a; font-size: 12px; font-weight: 700; }
+.letter-button { white-space: nowrap; }
+@media (max-width: 620px) {
+  .letter-options { grid-template-columns: 1fr; }
+  .letter-footer .secondary-button, .letter-footer .primary-button { flex: 1; justify-content: center; }
+  .letter-saved { flex-basis: 100%; }
 }

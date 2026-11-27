@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownRight, ArrowRight, Bookmark, BriefcaseBusiness, CalendarClock, Check, CheckCircle2,
-  Building2, ChevronDown, CircleHelp, ExternalLink, FileDown, FileUp, Filter, Globe2,
+  Building2, ChevronDown, CircleHelp, ExternalLink, FileDown, FileText, FileUp, Filter, Globe2,
   RefreshCw, Search, Send, ShieldCheck,
   SlidersHorizontal, Sparkles, Target, Trash2, TrendingUp, X, Zap,
 } from 'lucide-react';
@@ -20,7 +20,10 @@ import type { SavedFilter } from './lib/tracker';
 import { companyFromUrl, companyId, companyLabel, MAX_FOLLOWED, sanitizeCompanies } from '../lib/companies';
 import { addSearch, afterCheck, afterRun, applySnapshot, createSearch, keyOf, newSince, removeSearch, sameSearch, sanitizeSavedSearches, searchSignature, snapshotOf } from './lib/savedSearches';
 import type { SavedSearch, SearchSnapshot } from './lib/savedSearches';
+import { sanitizeLetters, saveLetter } from './lib/coverLetter';
+import type { GeneratedLetter, LetterRequest, LetterStore } from './lib/coverLetter';
 import { CompanyFollow } from './components/CompanyFollow';
+import { CoverLetterDialog } from './components/CoverLetterDialog';
 import { SavedSearches } from './components/SavedSearches';
 import { LocationPicker } from './components/LocationPicker';
 import { SourcePicker } from './components/SourcePicker';
@@ -31,6 +34,8 @@ import './styles.css';
 const PROFILE_KEY = 'careerpilot.job-radar.profile.v1';
 const JOBS_KEY = 'careerpilot.job-radar.saved-jobs.v1';
 const SEARCHES_KEY = 'careerpilot.job-radar.saved-searches.v1';
+const LETTERS_KEY = 'careerpilot.job-radar.cover-letters.v1';
+const LETTER_NAME_KEY = 'careerpilot.job-radar.letter-name.v1';
 
 type Tab = 'radar' | 'saved';
 type FilterKey = 'all' | 'strong' | 'medium' | 'new';
@@ -128,6 +133,19 @@ function readSearches(): SavedSearch[] {
   }
 }
 
+function readLetters(): LetterStore {
+  try {
+    const value = localStorage.getItem(LETTERS_KEY);
+    return sanitizeLetters(value ? JSON.parse(value) : {});
+  } catch {
+    return {};
+  }
+}
+
+function readLetterName(): string {
+  try { return (localStorage.getItem(LETTER_NAME_KEY) ?? '').slice(0, 80); } catch { return ''; }
+}
+
 /** Sends one search to the server. `extra` carries the paging fields of "Search More Jobs". */
 async function requestSearch(search: SearchSnapshot, extra: Record<string, unknown>, unavailable: string): Promise<JobSearchResponse> {
   const response = await fetch('/api/search-jobs', {
@@ -198,6 +216,9 @@ function App() {
   const [checking, setChecking] = useState<string | null>(null);
   // Which search the results on screen belong to, so saving the search can mark them as already seen.
   const [resultsSignature, setResultsSignature] = useState('');
+  const [letters, setLetters] = useState<LetterStore>(readLetters);
+  const [letterName, setLetterName] = useState(readLetterName);
+  const [letterJob, setLetterJob] = useState<JobResult | null>(null);
   const [lastQueries, setLastQueries] = useState<{ queries: string[]; planner: 'nemotron' | 'rules' } | null>(null);
   const importInput = useRef<HTMLInputElement>(null);
   const cvInput = useRef<HTMLInputElement>(null);
@@ -216,6 +237,14 @@ function App() {
   useEffect(() => {
     try { localStorage.setItem(SEARCHES_KEY, JSON.stringify(savedSearches)); } catch { /* storage can be disabled */ }
   }, [savedSearches]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LETTERS_KEY, JSON.stringify(letters)); } catch { /* storage can be disabled */ }
+  }, [letters]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LETTER_NAME_KEY, letterName); } catch { /* storage can be disabled */ }
+  }, [letterName]);
 
   const fallbackLinks = useMemo(() => buildSearchFallbackLinks({ ...profile, location: profile.locations[0] ?? '' }), [profile]);
   // Only the first `visibleCount` of the ranked pool is shown; the rest stays hidden until "Search More Jobs".
@@ -476,6 +505,36 @@ function App() {
     return payload.analysis;
   }
 
+  async function generateLetter(job: JobResult, request: LetterRequest): Promise<GeneratedLetter> {
+    const response = await fetch('/api/cover-letter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        profile: {
+          targetRoles: profile.targetRoles,
+          skills: profile.skills,
+          education: profile.education,
+          // The resume text is only included when the user ticks the box for this letter.
+          resumeText: request.includeResume ? profile.experienceSummary : '',
+        },
+        job: { title: job.title, domain: job.domain, content: job.details || job.content },
+        options: { tone: request.tone, emphasis: request.emphasis, name: request.name },
+      }),
+    });
+    const payload = await response.json().catch(() => null) as (Partial<GeneratedLetter> & { error?: string }) | null;
+    if (!response.ok || !payload || typeof payload.letter !== 'string') throw new Error(payload?.error || 'AI cover letters are not available right now. You can use the template instead.');
+    return {
+      letter: payload.letter,
+      model: typeof payload.model === 'string' ? payload.model : '',
+      placeholders: Array.isArray(payload.placeholders) ? payload.placeholders.filter((item): item is string => typeof item === 'string') : [],
+      unsupportedNumbers: Array.isArray(payload.unsupportedNumbers) ? payload.unsupportedNumbers.filter((item): item is string => typeof item === 'string') : [],
+    };
+  }
+
+  function keepLetter(job: JobResult, text: string) {
+    setLetters((current) => saveLetter(current, job.url, { text, title: job.title }));
+  }
+
   function saveCurrentSearch(name: string) {
     const snapshot = snapshotOf(profile);
     if (!snapshot.targetRoles.trim() || snapshot.sources.length === 0) {
@@ -586,6 +645,7 @@ function App() {
       profile,
       savedJobs,
       savedSearches,
+      coverLetters: letters,
     };
     downloadText(`careerpilot-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), 'application/json');
   }
@@ -603,6 +663,7 @@ function App() {
       setSavedJobs(normalizeJobs(backup.savedJobs));
       // Backups made before saved searches existed simply leave the saved searches as they are.
       if ('savedSearches' in backup) setSavedSearches(sanitizeSavedSearches((backup as { savedSearches: unknown }).savedSearches));
+      if ('coverLetters' in backup) setLetters(sanitizeLetters((backup as { coverLetters: unknown }).coverLetters));
       setSearchNote('Backup imported on this device.');
       setSearchError('');
     } catch (error) {
@@ -722,7 +783,7 @@ function App() {
                   <SourcePicker value={profile.sources} onChange={(sources) => setProfile((current) => ({ ...current, sources }))} />
                   <CompanyFollow value={profile.companies} onChange={(companies) => updateProfile('companies', companies)} />
                 </div>
-                <div className="local-note"><ShieldCheck size={16} /><span><strong>Private by default</strong>Your pasted resume and education stay in this browser. Search sends only target roles, skills, locations, work preference, time window, sources and any companies you follow. The optional Nemotron features send more: query planning uses the same roles, skills and location; “Extract profile with Nemotron AI” sends the resume text when you click it; job explanations send your education and the snippet — plus resume text only if you tick the box above.</span></div>
+                <div className="local-note"><ShieldCheck size={16} /><span><strong>Private by default</strong>Your pasted resume and education stay in this browser. Search sends only target roles, skills, locations, work preference, time window, sources and any companies you follow. The optional Nemotron features send more: query planning uses the same roles, skills and location; “Extract profile with Nemotron AI” sends the resume text when you click it; job explanations send your education and the snippet — plus resume text only if you tick the box above; cover letters send the listing text, your roles, skills, education and the name you type, plus resume text only if you tick the box in the letter window.</span></div>
                 <button className="primary-button full-width" onClick={() => void runSearch()} disabled={loading}><Search size={17} /> {loading ? 'Searching the web…' : 'Find matching jobs'} <ArrowRight size={17} /></button>
                 <button className="text-button full-width" onClick={() => { setProfile(sanitizeProfile(DEFAULT_PROFILE)); setCvName(''); setSearchError(''); setSearchNote('Profile cleared on this device.'); }}>Clear profile</button>
               </div>}
@@ -744,7 +805,7 @@ function App() {
             <section className="panel quick-panel">
               <div className="quick-title"><span className="heading-icon"><Zap size={17} /></span><strong>Quick actions</strong></div>
               <button className="quick-action" onClick={() => setShowManualForm(true)}><span className="quick-action-icon"><ExternalLink size={16} /></span><span><strong>Add a job URL</strong><small>Save a listing you found elsewhere</small></span><ArrowDownRight size={16} /></button>
-              <button className="quick-action" onClick={exportBackup}><span className="quick-action-icon"><FileDown size={16} /></span><span><strong>Export backup</strong><small>Download profile, saved jobs and searches</small></span><ArrowDownRight size={16} /></button>
+              <button className="quick-action" onClick={exportBackup}><span className="quick-action-icon"><FileDown size={16} /></span><span><strong>Export backup</strong><small>Download profile, saved jobs, searches and letters</small></span><ArrowDownRight size={16} /></button>
               <button className="quick-action" onClick={() => importInput.current?.click()}><span className="quick-action-icon"><RefreshCw size={16} /></span><span><strong>Restore backup</strong><small>Import a CareerPilot JSON backup</small></span><ArrowDownRight size={16} /></button>
               <input ref={importInput} type="file" accept="application/json,.json" className="hidden-input" onChange={(event) => void importBackup(event.target.files?.[0])} />
             </section>
@@ -776,7 +837,7 @@ function App() {
                 </div>}
 
               {!loading && results.length > 0 && visibleResults.length === 0 && <div className="small-empty"><Filter size={20} /><strong>No results in this range</strong><span>Choose another filter to see more listings.</span></div>}
-              {!loading && visibleResults.map((job) => <JobCard key={job.id} job={job} saved={savedUrlSet.has(job.url)} onSave={() => saveJob(job)} savedStatus={savedStatusByUrl.get(job.url)} onApplied={() => applyTo(job)} onOpen={() => openListing(job)} isNew={newKeys.has(keyOf(job))} follow={followFor(job)} onAnalyze={analyzeJob} canAnalyze={Boolean(profile.targetRoles.trim())} />)}
+              {!loading && visibleResults.map((job) => <JobCard key={job.id} job={job} saved={savedUrlSet.has(job.url)} onSave={() => saveJob(job)} savedStatus={savedStatusByUrl.get(job.url)} onApplied={() => applyTo(job)} onOpen={() => openListing(job)} isNew={newKeys.has(keyOf(job))} follow={followFor(job)} hasLetter={Boolean(letters[job.url])} onCoverLetter={() => setLetterJob(job)} onAnalyze={analyzeJob} canAnalyze={Boolean(profile.targetRoles.trim())} />)}
 
               {!loading && results.length > 0 && (canSearchMore || loadingMore) && <div className="more-row"><button className="secondary-button more-button" onClick={() => void searchMore()} disabled={loadingMore} aria-busy={loadingMore}>{loadingMore && <RefreshCw size={15} className="spin" />}Search More Jobs</button></div>}
 
@@ -793,7 +854,7 @@ function App() {
               {dueCount > 0 && <div className="alert info-alert due-alert"><CalendarClock size={17} /><span>{dueCount} follow-up{dueCount === 1 ? ' is' : 's are'} due. They are listed first.</span></div>}
               {savedJobs.length === 0 ? <div className="small-empty saved-empty"><Bookmark size={23} /><strong>No saved jobs yet</strong><span>Search for openings and save the ones worth pursuing, or add a URL manually.</span><button className="secondary-button" onClick={() => setTab('radar')}>Go to Job Radar <ArrowRight size={15} /></button></div> 
                 : visibleSaved.length === 0 ? <div className="small-empty"><Filter size={20} /><strong>No jobs at this stage</strong><span>Pick another stage, or move a job here from its status menu.</span></div>
-                : visibleSaved.map((job) => <JobCard key={job.id} job={job} saved onSave={() => undefined} today={today} onTrackingChange={(patch) => updateTracking(job.id, patch)} onOpen={() => openListing(job)} statusControl onStatusChange={(status) => updateStatus(job.id, status)} onRemove={() => removeSavedJob(job.id)} onAnalyze={analyzeJob} canAnalyze={Boolean(profile.targetRoles.trim())} />)}
+                : visibleSaved.map((job) => <JobCard key={job.id} job={job} saved onSave={() => undefined} today={today} onTrackingChange={(patch) => updateTracking(job.id, patch)} onOpen={() => openListing(job)} statusControl onStatusChange={(status) => updateStatus(job.id, status)} onRemove={() => removeSavedJob(job.id)} hasLetter={Boolean(letters[job.url])} onCoverLetter={() => setLetterJob(job)} onAnalyze={analyzeJob} canAnalyze={Boolean(profile.targetRoles.trim())} />)}
             </>}
           </section>
         </div>
@@ -808,6 +869,20 @@ function App() {
         <label className="field"><span className="field-label">Location</span><input value={manualLocation} onChange={(event) => setManualLocation(event.target.value)} placeholder="City or remote" /></label>
         <label className="field"><span className="field-label">Job description or notes</span><textarea value={manualDescription} onChange={(event) => setManualDescription(event.target.value)} placeholder="Paste key requirements or notes for your own reference…" rows={4} /></label>
       </div><div className="modal-footer"><button className="secondary-button" onClick={() => setShowManualForm(false)}>Cancel</button><button className="primary-button" onClick={addManualJob}><Bookmark size={16} /> Save opportunity</button></div></section></div>}
+      {letterJob && <CoverLetterDialog
+        key={letterJob.url}
+        job={letterJob}
+        initialText={letters[letterJob.url]?.text ?? ''}
+        name={letterName}
+        onNameChange={setLetterName}
+        skills={profile.skills}
+        education={profile.education}
+        hasResume={Boolean(profile.experienceSummary.trim())}
+        canGenerate={Boolean(profile.targetRoles.trim())}
+        onGenerate={(request) => generateLetter(letterJob, request)}
+        onSave={(text) => keepLetter(letterJob, text)}
+        onClose={() => setLetterJob(null)}
+      />}
       {returnJob && <div className="return-prompt" role="dialog" aria-label="Did you apply?">
         <div className="return-prompt-text"><strong>Did you apply?</strong><span>{returnJob.title}</span></div>
         <div className="return-prompt-actions">
@@ -839,9 +914,12 @@ interface JobCardProps {
   /** The listing was not shown the last time this saved search was run. */
   isNew?: boolean;
   follow?: FollowOffer;
+  /** Opens the cover letter dialog. */
+  onCoverLetter?: () => void;
+  hasLetter?: boolean;
 }
 
-function JobCard({ job, saved, onSave, statusControl = false, onStatusChange, onRemove, onAnalyze, canAnalyze = false, savedStatus, onApplied, onOpen, today, onTrackingChange, isNew = false, follow }: JobCardProps) {
+function JobCard({ job, saved, onSave, statusControl = false, onStatusChange, onRemove, onAnalyze, canAnalyze = false, savedStatus, onApplied, onOpen, today, onTrackingChange, isNew = false, follow, onCoverLetter, hasLetter = false }: JobCardProps) {
   const [showDetails, setShowDetails] = useState(false);
   const [analysis, setAnalysis] = useState<AiAnalysis | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
@@ -881,7 +959,7 @@ function JobCard({ job, saved, onSave, statusControl = false, onStatusChange, on
       <small>Generated by NVIDIA Nemotron from {job.details ? 'the listing text the search found' : 'the search snippet only'}. It can be wrong; the percentage above is unchanged.</small></>}</div>}
     {showDetails && <div className="job-details"><div><strong>Original source</strong><a href={job.url} target="_blank" rel="noreferrer">{job.url} <ExternalLink size={12} /></a></div><div><strong>Match interpretation</strong><p>The percentage is a keyword-based preliminary ranking of the available title, URL and {job.details ? 'listing text' : 'snippet'}. It is not a hiring probability and may change after the full job description is reviewed.</p></div>{job.details && <div><strong>Listing text the search found</strong><p className="listing-text">{job.details}</p></div>}</div>}
     {statusControl && today && onTrackingChange && <TrackerFields job={job} today={today} onChange={onTrackingChange} />}
-    <div className="job-card-footer"><button className="details-button" onClick={() => setShowDetails((current) => !current)}>{showDetails ? 'Hide details' : 'Why this match?'} <ChevronDown className={showDetails ? 'chevron open' : 'chevron'} size={14} /></button><div className="job-actions">{statusControl && <select className={`status-select status-${job.status.toLowerCase()}`} value={job.status} onChange={(event) => onStatusChange?.(event.target.value as ApplicationStatus)} aria-label={`Application status for ${job.title}`}>{STATUS_OPTIONS.map((status) => <option key={status}>{status}</option>)}</select>}{statusControl && <button className="icon-button danger" title="Remove saved job" aria-label="Remove saved job" onClick={onRemove}><Trash2 size={16} /></button>}{!statusControl && <button className={saved ? 'save-button saved' : 'save-button'} onClick={onSave} disabled={saved}>{saved ? <><Check size={15} /> Saved</> : <><Bookmark size={15} /> Save job</>}</button>}{!statusControl && onApplied && <button className={hasApplied(savedStatus) ? 'applied-button done' : 'applied-button'} onClick={onApplied} disabled={hasApplied(savedStatus)}>{hasApplied(savedStatus) ? <><Check size={15} /> Applied</> : <><Send size={14} /> Mark applied</>}</button>}{onAnalyze && <button className="secondary-button ai-button" onClick={() => void runAnalysis()} disabled={!canAnalyze || analysisLoading} title={canAnalyze ? 'Explain this match with an AI model' : 'Add a target job title first'}><Sparkles size={14} /> {analysisLoading ? 'Analyzing…' : analysis ? 'Re-run AI' : 'Explain with Nemotron'}</button>}{follow && !statusControl && <button className="text-button follow-button" onClick={follow.onFollow} disabled={follow.following} title={follow.following ? `${follow.label} is followed` : `Read ${follow.label}'s job board on every search`}>{follow.following ? <><Check size={13} /> Following</> : <><Building2 size={13} /> Follow company</>}</button>}<a className="apply-button" href={job.url} target="_blank" rel="noreferrer" onClick={onOpen}>Open listing <ExternalLink size={14} /></a></div></div>
+    <div className="job-card-footer"><button className="details-button" onClick={() => setShowDetails((current) => !current)}>{showDetails ? 'Hide details' : 'Why this match?'} <ChevronDown className={showDetails ? 'chevron open' : 'chevron'} size={14} /></button><div className="job-actions">{statusControl && <select className={`status-select status-${job.status.toLowerCase()}`} value={job.status} onChange={(event) => onStatusChange?.(event.target.value as ApplicationStatus)} aria-label={`Application status for ${job.title}`}>{STATUS_OPTIONS.map((status) => <option key={status}>{status}</option>)}</select>}{statusControl && <button className="icon-button danger" title="Remove saved job" aria-label="Remove saved job" onClick={onRemove}><Trash2 size={16} /></button>}{!statusControl && <button className={saved ? 'save-button saved' : 'save-button'} onClick={onSave} disabled={saved}>{saved ? <><Check size={15} /> Saved</> : <><Bookmark size={15} /> Save job</>}</button>}{!statusControl && onApplied && <button className={hasApplied(savedStatus) ? 'applied-button done' : 'applied-button'} onClick={onApplied} disabled={hasApplied(savedStatus)}>{hasApplied(savedStatus) ? <><Check size={15} /> Applied</> : <><Send size={14} /> Mark applied</>}</button>}{onCoverLetter && <button className="secondary-button letter-button" onClick={onCoverLetter} title={hasLetter ? 'Open the cover letter kept for this job' : 'Draft a cover letter for this job'}><FileText size={14} /> {hasLetter ? 'Edit cover letter' : 'Cover letter'}</button>}{onAnalyze && <button className="secondary-button ai-button" onClick={() => void runAnalysis()} disabled={!canAnalyze || analysisLoading} title={canAnalyze ? 'Explain this match with an AI model' : 'Add a target job title first'}><Sparkles size={14} /> {analysisLoading ? 'Analyzing…' : analysis ? 'Re-run AI' : 'Explain with Nemotron'}</button>}{follow && !statusControl && <button className="text-button follow-button" onClick={follow.onFollow} disabled={follow.following} title={follow.following ? `${follow.label} is followed` : `Read ${follow.label}'s job board on every search`}>{follow.following ? <><Check size={13} /> Following</> : <><Building2 size={13} /> Follow company</>}</button>}<a className="apply-button" href={job.url} target="_blank" rel="noreferrer" onClick={onOpen}>Open listing <ExternalLink size={14} /></a></div></div>
   </article>;
 }
 
