@@ -38,5 +38,12 @@ export function describeFailures(failed: number | undefined, total: number): str
   return ` ${failed} of ${total} searches failed, so these results may be incomplete. Search again in a minute.`;
 }
 
+/** Says how the followed companies' job boards went. Empty when none are followed. */
+export function describeFeeds(feeds: { boards: number; ok: number; failed: number; matched: number } | undefined): string {
+  if (!feeds || feeds.boards <= 0) return '';
+  const read = `Read ${feeds.ok} of ${plural(feeds.boards, 'followed company board')}: ${plural(feeds.matched, 'matching opening')}.`;
+  return feeds.failed > 0 ? ` ${read} ${plural(feeds.failed, 'board')} could not be reached.` : ` ${read}`;
+}
+
 /** "last 1 week" -> "1 week"; "last 1 day (24h)" -> "1 day". Used in "older than 1 week". */
 export const windowAge = (windowId: string): string => ({ '1d': '1 day', '1w': '1 week', '2w': '2 weeks', '3w': '3 weeks', '4w': '4 weeks' } as Record<string, string>)[windowId] ?? windowId;

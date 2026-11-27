@@ -43,3 +43,32 @@ describe('rankJobs ordering', () => {
     expect(ranked[0].title).toContain('Supply Chain Manager');
   });
 });
+
+describe('listing text (details)', () => {
+  const withSkills = { ...profile, skills: 'SAP, Excel, Power BI', education: 'MBA' };
+
+  it('finds skills and education in the listing text that the snippet does not show', () => {
+    const snippet = scoreJob(job('Supply Chain Manager — Acme', 'Mumbai'), withSkills);
+    const full = scoreJob({ ...job('Supply Chain Manager — Acme', 'Mumbai'), details: 'You know SAP and Excel. An MBA is preferred.' }, withSkills);
+    expect(full.matchScore).toBeGreaterThan(snippet.matchScore);
+    expect(full.matchedTerms).toEqual(expect.arrayContaining(['SAP', 'Excel', 'MBA']));
+    expect(full.missingTerms).toEqual(['Power BI']);
+  });
+
+  it('never lets the listing text add role or location points', () => {
+    const a = scoreJob(job('Marketing Coordinator — Acme', 'Pune'), { ...withSkills, location: 'Mumbai' });
+    const b = scoreJob({ ...job('Marketing Coordinator — Acme', 'Pune'), details: 'Supply Chain Manager reports here. Mumbai office. Please apply.' }, { ...withSkills, location: 'Mumbai' });
+    expect(b.matchScore).toBe(a.matchScore);
+    expect(b.matchedTerms).not.toContain('Supply Chain Manager');
+  });
+
+  it('gives the same score as before when there is no listing text', () => {
+    const plain = job('Supply Chain Manager — Mumbai', 'Apply now');
+    expect(scoreJob({ ...plain, details: undefined }, withSkills).matchScore).toBe(scoreJob(plain, withSkills).matchScore);
+    expect(scoreJob({ ...plain, details: '' }, withSkills).matchScore).toBe(scoreJob(plain, withSkills).matchScore);
+  });
+
+  it('keeps the listing text on the result', () => {
+    expect(scoreJob({ ...job('Supply Chain Manager — Acme'), details: 'text here' }, profile).details).toBe('text here');
+  });
+});

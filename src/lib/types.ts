@@ -16,6 +16,8 @@ export interface CareerProfile {
   education: string;
   timeWindow: TimeWindowId;
   sources: SourceId[];
+  /** Followed companies whose job boards are read directly, such as "greenhouse:stripe". */
+  companies: string[];
 }
 
 export interface RawJobResult {
@@ -26,6 +28,10 @@ export interface RawJobResult {
   publishedDate?: string | null;
   /** Stable identity of the posting (from the search function), used to avoid showing it twice. */
   key?: string;
+  /** The listing's own text (cleaned, up to about 2,000 characters), when the search found it. Used to match skills. */
+  details?: string;
+  /** True when the opening was read from a followed company's own job board (Greenhouse or Lever). */
+  fromBoard?: boolean;
 }
 
 export interface JobResult extends RawJobResult {
@@ -36,6 +42,12 @@ export interface JobResult extends RawJobResult {
   missingTerms: string[];
   status: ApplicationStatus;
   savedAt?: string;
+  /** When the user applied (set the first time the job reaches Applied or later). */
+  appliedAt?: string;
+  /** Day (YYYY-MM-DD) to follow up. Defaults to a week after applying and can be changed. */
+  followUpAt?: string;
+  /** The user's own notes, kept on this device. */
+  notes?: string;
   searchQuery?: string;
 }
 
@@ -54,6 +66,8 @@ export interface JobSearchResponse {
   queriesFailed?: number;
   /** True when the answer came from the server's short-lived cache. */
   cached?: boolean;
+  /** What reading the followed companies' job boards found. Absent when none are followed. */
+  feeds?: { boards: number; ok: number; failed: number; scanned: number; matched: number };
   queries?: string[];
   planner?: 'nemotron' | 'rules';
   page?: number;
@@ -86,6 +100,7 @@ export const DEFAULT_PROFILE: CareerProfile = {
   education: '',
   timeWindow: DEFAULT_TIME_WINDOW,
   sources: [...DEFAULT_SOURCES],
+  companies: [],
 };
 
 export const STATUS_OPTIONS: ApplicationStatus[] = ['Saved', 'Applied', 'Interview', 'Offer', 'Rejected'];

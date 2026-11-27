@@ -31,3 +31,16 @@ export function scrollToElement(element: HTMLElement | null): void {
   const reduce = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   element.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
 }
+
+/** Downloads text as a file from the browser, without sending it anywhere. */
+export function downloadText(filename: string, text: string, mime: string): void {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}

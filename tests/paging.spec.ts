@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canSearchMore, describeExclusions, MAX_BATCHES, PAGE_SIZE, revealNext, visibleAfterFetch, windowAge } from '../src/lib/paging';
+import { canSearchMore, describeExclusions, MAX_BATCHES, PAGE_SIZE, revealNext, visibleAfterFetch, windowAge, describeFeeds } from '../src/lib/paging';
 
 describe('paging', () => {
   it('shows 10 at a time', () => {
@@ -28,5 +28,17 @@ describe('paging', () => {
       .toBe(' Left out: 12 search or category pages, 1 listing for other places, 4 older than 1 week.');
     expect(describeExclusions({ notVacancy: 0, wrongLocation: 0, undated: 0, tooOld: 0 }, 'week')).toBe('');
     expect(describeExclusions(undefined, 'week')).toBe('');
+  });
+});
+
+describe('describeFeeds', () => {
+  it('says nothing when no company is followed', () => {
+    expect(describeFeeds(undefined)).toBe('');
+    expect(describeFeeds({ boards: 0, ok: 0, failed: 0, matched: 0 })).toBe('');
+  });
+  it('reports what was read, and what could not be', () => {
+    expect(describeFeeds({ boards: 3, ok: 3, failed: 0, matched: 4 })).toBe(' Read 3 of 3 followed company boards: 4 matching openings.');
+    expect(describeFeeds({ boards: 1, ok: 1, failed: 0, matched: 1 })).toBe(' Read 1 of 1 followed company board: 1 matching opening.');
+    expect(describeFeeds({ boards: 3, ok: 2, failed: 1, matched: 0 })).toContain('1 board could not be reached.');
   });
 });

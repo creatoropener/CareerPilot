@@ -117,15 +117,18 @@ export function scoreJob(raw: RawJobResult, profile: CareerProfile): JobResult {
   const roles = splitList(profile.targetRoles);
   const skills = splitList(profile.skills);
   const location = profile.location.trim();
+  // Role, location and the "apply" hint are judged on the title, snippet and link only. The listing's longer text
+  // (when the search found it) is used for skills, education and the experience summary, where it is better evidence.
   const allText = `${raw.title} ${raw.content} ${raw.url}`.toLocaleLowerCase();
+  const detailText = raw.details ? `${allText} ${raw.details.toLocaleLowerCase()}` : allText;
   const titleText = raw.title.toLocaleLowerCase();
   const matchedRoles = roles.filter((term) => roleMatches(allText, term));
   // A role in the job title is what the listing is for; a role that only appears in the body or the link is weaker evidence.
   const roleInTitle = matchedRoles.some((term) => roleMatches(titleText, term));
-  const matchedSkills = skills.filter((term) => includesTerm(allText, term));
-  const matchedEducation = splitList(profile.education).filter((term) => includesTerm(allText, term));
+  const matchedSkills = skills.filter((term) => includesTerm(detailText, term));
+  const matchedEducation = splitList(profile.education).filter((term) => includesTerm(detailText, term));
   const summaryTerms = extractSummaryTerms(profile.experienceSummary);
-  const matchedSummary = summaryTerms.filter((term) => includesTerm(allText, term));
+  const matchedSummary = summaryTerms.filter((term) => includesTerm(detailText, term));
   const matchedTerms = [...matchedRoles, ...matchedSkills, ...matchedEducation, ...matchedSummary]
     .filter((term, index, array) => array.findIndex((entry) => entry.toLowerCase() === term.toLowerCase()) === index);
 

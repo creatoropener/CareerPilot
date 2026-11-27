@@ -14,6 +14,11 @@ import type { SourceDef } from '../lib/sources.js';
 import { listingMatchesAnyPlace, parsePlace } from '../lib/geo.js';
 import { classifyListing, describeListing, listingKey } from '../lib/listings.js';
 import { clientIp, createRateLimiter, createTtlCache, envNumber } from '../lib/guards.js';
+import { readBoards } from '../lib/ats.js';
+import type { BoardJob, FeedSummary } from '../lib/ats.js';
+import { MAX_BOARDS_PER_SEARCH, boardFromId, sanitizeCompanies } from '../lib/companies.js';
+import type { CompanyBoard } from '../lib/companies.js';
+import { cleanPageText } from '../lib/text.js';
 
 interface SearchRequest {
   timeWindow?: string;
@@ -27,6 +32,8 @@ interface SearchRequest {
   page?: unknown;
   /** Keys of listings the browser already shows, so they are not returned again. */
   seen?: unknown;
+  /** Followed companies, such as "greenhouse:stripe". Their job boards are read directly (new searches only). */
+  companies?: unknown;
 }
 
 interface TavilyResult {
@@ -58,8 +65,13 @@ const MAX_PAGES = 4;
 const MAX_CANDIDATES = 30;
 const MAX_SEEN = 300;
 const MAX_PLACES = 5;
+const MAX_BOARDS = MAX_BOARDS_PER_SEARCH;
 const SOURCES_PER_CALL = 4;
 const LOCATION_TOKEN = '{location}';
+// Listing text sent to the browser so skills can be matched against more than a two-line snippet.
+const DETAILS_MAX = 2000;
+// A followed company's openings rank like a good search result.
+const FEED_RANK = 0.7;
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -358,9 +370,11 @@ export async function POST(request: Request): Promise<Response> {
   const places = parseLocations(profile);
   const page = clampPage(profile.page);
   const alreadyShown = parseSeen(profile.seen);
+  // Followed companies are read on a new search only; "Search More Jobs" (page 2 and later) skips them.
+  const followed = page === 1 ? sanitizeCompanies(profile.companies, MAX_BOARDS).map(boardFromId).filter((board): board is CompanyBoard => board !== null) : [];
 
   // The same search again (Refresh, a double click, two people with the same profile) is answered from the cache.
-  const cacheKey = JSON.stringify([window, [...sourceIds].sort(), targetRoles, cleanProfile.skills, cleanProfile.workMode, places, page, [...alreadyShown].sort()]);
+  const cacheKey = JSON.stringify([window, [...sourceIds].sort(), targetRoles, cleanProfile.skills, cleanProfile.workMode, places, page, [...alreadyShown].sort(), followed.map((board) => `${board.provider}${board.eu ? '-eu' : ''}:${board.token}`)]);
   const cached = searchCache.get(cacheKey);
   if (cached) return json({ ...cached, cached: true }, 200, { 'Cache-Control': 'no-store', 'X-Cache': 'HIT' });
 
@@ -380,12 +394,26 @@ export async function POST(request: Request): Promise<Response> {
   const planner = planned.length > 0 ? 'nemotron' : 'rules';
 
   const now = new Date();
+  const placeSpecs = places.map(parsePlace);
+  const allowRemote = cleanProfile.workMode === 'Remote';
+
+  // Followed companies are read at the same time as the web searches. A failure here never fails the search.
+  const roles = targetRoles.split(/[\n,;|]/).map((part) => part.trim()).filter(Boolean).slice(0, 4);
+  const feedRequest = followed.length
+    ? readBoards(followed, {
+      roles,
+      matchesPlace: (job) => listingMatchesAnyPlace(placeSpecs, { title: job.title, url: job.url, snippet: `${job.location} ${job.team}` }, allowRemote),
+    }).catch((): null => null)
+    : Promise.resolve(null);
+
   const jobs = buildJobs(sources, queries, places, page, extraQueries(cleanProfile));
   // allSettled so one slow or failing query does not throw away the others.
   const settled = await Promise.allSettled(jobs.map((job) => runSearch(job.query, apiKey, { window, now, domains: job.domains, maxResults: job.maxResults })));
   const fulfilled = settled.filter((entry): entry is PromiseFulfilledResult<TavilyResult[]> => entry.status === 'fulfilled');
   const failedQueries = settled.length - fulfilled.length;
-  if (fulfilled.length === 0) {
+  const feed = await feedRequest;
+  const feedJobs: BoardJob[] = feed?.jobs ?? [];
+  if (fulfilled.length === 0 && !(feed && feed.summary.ok > 0)) {
     const rejected = settled.filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
     // The provider is rate-limiting us: tell the user to wait rather than reporting a broken service.
     if (rejected.some((entry) => entry.reason instanceof ProviderError && entry.reason.status === 429)) {
@@ -397,18 +425,21 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const allowedDomains = sources.flatMap((source) => source.domains);
-  const placeSpecs = places.map(parsePlace);
-  const allowRemote = cleanProfile.workMode === 'Remote';
   const excluded = { otherSource: 0, undated: 0, tooOld: 0, invalid: 0, notVacancy: 0, wrongLocation: 0, alreadyShown: 0, duplicate: 0 };
   const batchKeys = new Set<string>();
   const batchTitles = new Set<string>();
   const candidates: { job: ReturnType<typeof toJob>; rank: number; time: number }[] = [];
 
-  function toJob(result: TavilyResult, posted: { date: Date; source: string }, key: string) {
+  interface Described { role: string; company: string; title: string }
+
+  function toJob(result: TavilyResult, posted: { date: Date; source: string }, key: string, described: Described, details: string, fromBoard: boolean) {
     return {
-      title: describeListing(cleanField(result.title), places, result.url).title || 'Untitled job',
+      // Read from the company's own job board, not found by a web search. The browser then trusts its link shape.
+      ...(fromBoard ? { fromBoard: true } : {}),
+      title: described.title || 'Untitled job',
       url: result.url as string,
       content: cleanField(result.content),
+      details: details || undefined,
       score: typeof result.score === 'number' ? result.score : undefined,
       publishedDate: posted.date.toISOString(),
       dateSource: posted.source,
@@ -416,7 +447,22 @@ export async function POST(request: Request): Promise<Response> {
     };
   }
 
-  for (const result of fulfilled.flatMap((entry) => entry.value)) {
+  // A followed company's opening looks like a search result, with the board's own title, place and date.
+  const feedAsResult = (job: BoardJob): TavilyResult => ({
+    title: job.title,
+    url: job.url,
+    content: [job.location, job.team, job.details.replace(/\s+/g, ' ').slice(0, 260)].filter(Boolean).join(' · '),
+    published_date: job.postedAt ?? undefined,
+    score: FEED_RANK,
+    raw_content: job.details,
+  });
+
+  const entries: { result: TavilyResult; feed?: BoardJob }[] = [
+    ...fulfilled.flatMap((entry) => entry.value).map((result) => ({ result })),
+    ...feedJobs.map((job) => ({ result: feedAsResult(job), feed: job })),
+  ];
+
+  for (const { result, feed: board } of entries) {
     if (!result.url) { excluded.invalid += 1; continue; }
     try {
       if (!['http:', 'https:'].includes(new URL(result.url).protocol)) { excluded.invalid += 1; continue; }
@@ -427,15 +473,16 @@ export async function POST(request: Request): Promise<Response> {
     if (batchKeys.has(key)) continue;
     batchKeys.add(key);
 
-    // User-selected portals only.
-    if (!hostMatches(result.url, allowedDomains)) { excluded.otherSource += 1; continue; }
+    // User-selected portals only. A followed company is the user's own explicit choice.
+    if (!board && !hostMatches(result.url, allowedDomains)) { excluded.otherSource += 1; continue; }
     if (alreadyShown.has(key)) { excluded.alreadyShown += 1; continue; }
 
-    // One specific vacancy, not a search page, a category page or "15,000 vacancies".
-    if (!classifyListing({ url: result.url, title: result.title ?? '' }).ok) { excluded.notVacancy += 1; continue; }
+    // One specific vacancy, not a search page, a category page or "15,000 vacancies". A job board lists only vacancies.
+    if (!board && !classifyListing({ url: result.url, title: result.title ?? '' }).ok) { excluded.notVacancy += 1; continue; }
 
     // The listing must be for one of the selected places (title, link and snippet are checked, not page navigation).
-    if (!listingMatchesAnyPlace(placeSpecs, {
+    // A company's board was already checked against the places when it was read.
+    if (!board && !listingMatchesAnyPlace(placeSpecs, {
       title: result.title ?? '',
       url: result.url,
       snippet: result.content ?? '',
@@ -445,18 +492,21 @@ export async function POST(request: Request): Promise<Response> {
     // Strict time window: no verifiable date, or a date outside the window, means the listing is dropped.
     const posted = findPostedDate({
       publishedDate: result.published_date,
-      text: `${result.title ?? ''}\n${result.content ?? ''}\n${(result.raw_content ?? '').slice(0, 20_000)}`,
+      text: board ? `${result.title ?? ''}\n${result.content ?? ''}` : `${result.title ?? ''}\n${result.content ?? ''}\n${(result.raw_content ?? '').slice(0, 20_000)}`,
     }, now);
     if (!posted) { excluded.undated += 1; continue; }
     if (!isWithinWindow(posted.date, window, now)) { excluded.tooOld += 1; continue; }
 
     // The same job posted on two sites (same role and company) is shown once.
-    const described = describeListing(cleanField(result.title), places, result.url);
+    const described: Described = board
+      ? { role: board.title, company: board.company, title: `${board.title} — ${board.company}` }
+      : describeListing(cleanField(result.title), places, result.url);
     const titleKey = described.company ? `${described.role}|${described.company}`.toLowerCase() : '';
     if (titleKey && batchTitles.has(titleKey)) { excluded.duplicate += 1; continue; }
     if (titleKey) batchTitles.add(titleKey);
 
-    candidates.push({ job: toJob(result, posted, key), rank: typeof result.score === 'number' ? result.score : 0, time: posted.date.getTime() });
+    const details = board ? board.details.slice(0, DETAILS_MAX) : cleanPageText(result.raw_content, DETAILS_MAX);
+    candidates.push({ job: toJob(result, posted, key, described, details, Boolean(board)), rank: typeof result.score === 'number' ? result.score : 0, time: posted.date.getTime() });
   }
 
   // Best provider relevance first, newest first among equals. The browser re-ranks by profile match.
@@ -465,9 +515,10 @@ export async function POST(request: Request): Promise<Response> {
   const overflow = Math.max(0, candidates.length - MAX_CANDIDATES);
 
   const queriesSent = [...new Set(jobs.map((job) => job.query))];
-  const body = { results, queriesRun: fulfilled.length, queriesFailed: failedQueries, queries: queriesSent, planner, timeWindow: window, sources: sourceIds, locations: places, page, overflow, excluded };
+  const feeds: FeedSummary | undefined = feed?.summary ?? (followed.length ? { boards: followed.length, ok: 0, failed: followed.length, scanned: 0, matched: 0 } : undefined);
+  const body = { results, queriesRun: fulfilled.length, queriesFailed: failedQueries, feeds, queries: queriesSent, planner, timeWindow: window, sources: sourceIds, locations: places, page, overflow, excluded };
   // A search where some provider calls failed is incomplete, so it is not cached: trying again should try again.
-  if (failedQueries === 0) searchCache.set(cacheKey, body);
+  if (failedQueries === 0 && !(feeds && feeds.failed > 0)) searchCache.set(cacheKey, body);
   return json(body, 200, { 'Cache-Control': 'no-store' });
 }
 
