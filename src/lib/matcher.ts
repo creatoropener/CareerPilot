@@ -37,6 +37,20 @@ function includesTerm(haystack: string, term: string): boolean {
   return new RegExp(`(^|[^a-z0-9])${escapeRegex(normalizedTerm)}([^a-z0-9]|$)`, 'i').test(normalizedText);
 }
 
+// Words that carry no meaning when a job title is compared word by word.
+const ROLE_FILLER = new Set(['and', 'the', 'for', 'with', 'of']);
+
+/**
+ * True when every meaningful word of a multi-word role appears in the text, in any order, so the target
+ * "Supply Chain Manager" also finds "Manager, Supply Chain" and "Supply Chain & Logistics Manager".
+ * Single words are already covered by includesTerm.
+ */
+function includesAllWords(haystack: string, role: string): boolean {
+  const words = role.toLocaleLowerCase().split(/[^\p{L}\p{N}+#]+/u).filter((word) => word.length >= 3 && !ROLE_FILLER.has(word));
+  return words.length >= 2 && words.every((word) => includesTerm(haystack, word));
+}
+
+const roleMatches = (haystack: string, role: string): boolean => includesTerm(haystack, role) || includesAllWords(haystack, role);
 
 const RESUME_SKILL_CATALOG = [
   'SAP S/4HANA', 'SAP MM', 'SAP SD', 'SAP FI', 'SAP TM', 'SAP', 'Excel', 'Advanced Excel',
@@ -103,17 +117,23 @@ export function scoreJob(raw: RawJobResult, profile: CareerProfile): JobResult {
   const roles = splitList(profile.targetRoles);
   const skills = splitList(profile.skills);
   const location = profile.location.trim();
+  // Role, location and the "apply" hint are judged on the title, snippet and link only. The listing's longer text
+  // (when the search found it) is used for skills, education and the experience summary, where it is better evidence.
   const allText = `${raw.title} ${raw.content} ${raw.url}`.toLocaleLowerCase();
-  const matchedRoles = roles.filter((term) => includesTerm(allText, term));
-  const matchedSkills = skills.filter((term) => includesTerm(allText, term));
-  const matchedEducation = splitList(profile.education).filter((term) => includesTerm(allText, term));
+  const detailText = raw.details ? `${allText} ${raw.details.toLocaleLowerCase()}` : allText;
+  const titleText = raw.title.toLocaleLowerCase();
+  const matchedRoles = roles.filter((term) => roleMatches(allText, term));
+  // A role in the job title is what the listing is for; a role that only appears in the body or the link is weaker evidence.
+  const roleInTitle = matchedRoles.some((term) => roleMatches(titleText, term));
+  const matchedSkills = skills.filter((term) => includesTerm(detailText, term));
+  const matchedEducation = splitList(profile.education).filter((term) => includesTerm(detailText, term));
   const summaryTerms = extractSummaryTerms(profile.experienceSummary);
-  const matchedSummary = summaryTerms.filter((term) => includesTerm(allText, term));
+  const matchedSummary = summaryTerms.filter((term) => includesTerm(detailText, term));
   const matchedTerms = [...matchedRoles, ...matchedSkills, ...matchedEducation, ...matchedSummary]
     .filter((term, index, array) => array.findIndex((entry) => entry.toLowerCase() === term.toLowerCase()) === index);
 
   let score = 0;
-  if (roles.length > 0) score += matchedRoles.length > 0 ? 30 : 0;
+  if (roles.length > 0) score += matchedRoles.length > 0 ? (roleInTitle ? 30 : 20) : 0;
   else score += 12;
   if (skills.length > 0) score += Math.round((matchedSkills.length / skills.length) * 40);
   else score += 15;
@@ -163,7 +183,12 @@ export function rankJobs(results: RawJobResult[], profile: CareerProfile): JobRe
     seen.add(canonicalUrl);
     ranked.push(scoreJob({ ...raw, url: canonicalUrl }, profile));
   }
-  return ranked.sort((a, b) => b.matchScore - a.matchScore);
+  // Best match first; among equal scores the newer posting comes first. Undated results keep their search order.
+  const postedAt = (job: JobResult): number => {
+    const time = job.publishedDate ? Date.parse(job.publishedDate) : Number.NaN;
+    return Number.isNaN(time) ? 0 : time;
+  };
+  return ranked.sort((a, b) => b.matchScore - a.matchScore || postedAt(b) - postedAt(a));
 }
 
 export function buildSearchFallbackLinks(profile: CareerProfile): { label: string; url: string }[] {

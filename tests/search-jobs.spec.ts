@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { POST } from '../api/search-jobs';
+import { POST, resetSearchGuards } from '../api/search-jobs';
 
 const request = (payload: unknown) => new Request('http://x/api/search-jobs', { method: 'POST', body: JSON.stringify(payload) });
 const base = { targetRoles: 'Supply Chain Manager', skills: 'SAP', location: 'Mumbai', workMode: 'Any', timeWindow: '1w', sources: ['indeed', 'naukri'] };
@@ -18,7 +18,7 @@ function mockFetch(results: unknown[], planner?: () => Response) {
 }
 
 describe('POST /api/search-jobs', () => {
-  beforeEach(() => { process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
+  beforeEach(() => { resetSearchGuards(); process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
   afterEach(() => { vi.restoreAllMocks(); delete process.env.TAVILY_API_KEY; delete process.env.NEBIUS_API_KEY; });
 
   it('requires a valid time window: no missing value and no "all time"', async () => {
@@ -77,6 +77,7 @@ describe('POST /api/search-jobs', () => {
     expect(planned.map((call) => call.query)).toContain('logistics head vacancy "Mumbai"');
     expect(planned.every((call) => !call.query.includes('{location}'))).toBe(true);
     vi.restoreAllMocks();
+    resetSearchGuards(); // the same request again must reach the (now failing) planner, not the cache
     mockFetch([], () => new Response('down', { status: 503 }));
     expect(((await (await POST(request(base))).json()) as { planner: string }).planner).toBe('rules');
   });
@@ -85,5 +86,62 @@ describe('POST /api/search-jobs', () => {
     const sent = mockFetch([]);
     await POST(request({ ...base, sources: ['linkedin', 'indeed', 'glassdoor', 'naukri', 'ats'] }));
     expect(sent.length).toBeLessThanOrEqual(5);
+  });
+
+  it('answers an identical search from the cache without calling the provider again', async () => {
+    const sent = mockFetch([]);
+    const first = await POST(request(base));
+    const calls = sent.length;
+    expect(calls).toBeGreaterThan(0);
+    const second = await POST(request(base));
+    expect(sent.length).toBe(calls);
+    expect(second.headers.get('X-Cache')).toBe('HIT');
+    expect(((await second.json()) as { cached?: boolean }).cached).toBe(true);
+    expect(first.headers.get('X-Cache')).toBeNull();
+    // A different profile is a different search.
+    await POST(request({ ...base, targetRoles: 'Procurement Manager' }));
+    expect(sent.length).toBeGreaterThan(calls);
+  });
+
+  it('limits searches per client and tells them when to retry', async () => {
+    mockFetch([]);
+    const from = (ip: string, roles: string) => new Request('http://x/api/search-jobs', {
+      method: 'POST',
+      headers: { 'x-forwarded-for': `${ip}, 10.0.0.1` },
+      body: JSON.stringify({ ...base, targetRoles: roles }),
+    });
+    for (let index = 0; index < 6; index += 1) expect((await POST(from('203.0.113.7', `Role ${index}`))).status).toBe(200);
+    const limited = await POST(from('203.0.113.7', 'Role 7'));
+    expect(limited.status).toBe(429);
+    expect(Number(limited.headers.get('Retry-After'))).toBeGreaterThan(0);
+    expect(((await limited.json()) as { error: string }).error).toMatch(/Too many searches/);
+    // Another client is not affected, and a cached repeat does not count.
+    expect((await POST(from('198.51.100.9', 'Role 0'))).status).toBe(200);
+    expect((await POST(from('203.0.113.7', 'Role 0'))).status).toBe(200);
+  });
+
+  it('reports failed provider searches and does not cache an incomplete search', async () => {
+    let calls = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input).includes('nebius')) return new Response('', { status: 500 });
+      calls += 1;
+      return calls === 1 ? new Response('boom', { status: 500 }) : new Response(JSON.stringify({ results: [] }), { status: 200 });
+    });
+    const data = await (await POST(request({ ...base, sources: ['linkedin', 'indeed', 'glassdoor', 'naukri', 'ats'] }))).json() as { queriesRun: number; queriesFailed: number };
+    expect(data.queriesFailed).toBe(1);
+    expect(data.queriesRun).toBeGreaterThan(0);
+    const before = calls;
+    await POST(request({ ...base, sources: ['linkedin', 'indeed', 'glassdoor', 'naukri', 'ats'] }));
+    expect(calls).toBeGreaterThan(before);
+  });
+
+  it('turns a provider 429 into a "try again" answer', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => (String(input).includes('nebius')
+      ? new Response('', { status: 500 })
+      : new Response('slow down', { status: 429 })));
+    const response = await POST(request(base));
+    expect(response.status).toBe(429);
+    expect(response.headers.get('Retry-After')).toBe('60');
+    expect(((await response.json()) as { error: string }).error).toMatch(/busy/);
   });
 });

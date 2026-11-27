@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { POST } from '../api/search-jobs';
+import { POST, resetSearchGuards } from '../api/search-jobs';
 import { scoreJob } from '../src/lib/matcher';
 import { DEFAULT_PROFILE } from '../src/lib/types';
 
@@ -42,7 +42,7 @@ const request = (payload: unknown) => new Request('http://x/api/search-jobs', { 
 const base = { targetRoles: 'Supply Chain Manager', skills: 'SAP', workMode: 'Any', timeWindow: '1w' };
 
 describe('POST /api/search-jobs with several places and sites', () => {
-  beforeEach(() => { process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
+  beforeEach(() => { resetSearchGuards(); process.env.TAVILY_API_KEY = 'tv'; delete process.env.NEBIUS_API_KEY; });
   afterEach(() => { vi.restoreAllMocks(); delete process.env.TAVILY_API_KEY; });
 
   it('searches every selected place separately', async () => {

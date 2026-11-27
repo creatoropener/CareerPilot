@@ -12,6 +12,9 @@
     },
     "api/extract-profile.ts": {
       "maxDuration": 60
+    },
+    "api/cover-letter.ts": {
+      "maxDuration": 60
     }
   }
 }
